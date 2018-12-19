@@ -40,14 +40,30 @@ endif()
 option (ENABLE_TESTS "Enable tests" OFF)
 option (USE_LDD   "Enable Ldd library" OFF)
 option (USE_APRON "Enable Apron library" OFF)
+option (USE_ELINA "Enable Elina library" OFF)
 option (USE_STATS "Enable statistics" ON)
 option (USE_LOG   "Enable logging for debugging purposes" ON)
 option (BUILD_CRAB_LIBS_SHARED "Build all Crab libraries dynamically." ON)
+
+if (USE_APRON AND USE_ELINA)
+  message(FATAL_ERROR "Apron and Elina are not compatible: choose one")
+endif()
+
+# Directory where all (binary) tests will be located
+# Binary tests do not go to install directory by default
+if (ENABLE_TESTS)
+  if (NOT TEST_DIR)
+    set(TEST_DIR ${CMAKE_BINARY_DIR}/test-bin)
+  endif()  
+endif()
 
 if (NOT BUILD_CRAB_LIBS_SHARED)
    # put static libraries first unless we want dynamic libraries
    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a" ${CMAKE_FIND_LIBRARY_SUFFIXES})
 endif ()   
+
+# To remember the last configuration
+message(STATUS "cmake configuration: cmake -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX} -DUSE_APRON=${USE_APRON} -DUSE_ELINA=${USE_ELINA} -DUSE_LDD=${USE_LDD} -DENABLE_TESTS=${ENABLE_TESTS} -DTEST_DIR=${TEST_DIR}")
 
 if (BUILD_CRAB_LIBS_SHARED)
   message (STATUS "All crab libraries will be built dynamically")
@@ -70,11 +86,11 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
   # Mac OS X specific code
   set(CMAKE_MACOSX_RPATH TRUE)
 endif ()  
-if (NOT CMAKE_INSTALL_RPATH)
-  set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
-endif ()
+if (NOT CMAKE_INSTALL_RPATH )
+  set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/crab/lib")
+endif()
 
-
+   
 if (NOT BUILD_CRAB_LIBS_SHARED)
    set (Boost_USE_STATIC_LIBS ON)
 endif ()  
@@ -129,10 +145,8 @@ endif()
 endif ()
 
 
-if (USE_APRON)
-if (GIT_FOUND)
+if (USE_APRON OR USE_ELINA)
   get_filename_component (GMP_SEARCH_PATH ${GMP_INCLUDE_DIR} PATH)
-
   find_package(MPFR REQUIRED)
   if (MPFR_FOUND)
     get_filename_component (MPFR_SEARCH_PATH ${MPFR_INCLUDES} PATH)
@@ -151,14 +165,16 @@ if (GIT_FOUND)
         message(STATUS "Building opt-oct without vectorized operations.")
      endif ()
   endif ()
+endif ()
 
+if (USE_APRON)
+if (GIT_FOUND)
   if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     # Mac OS X specific code
     set (APRON_TAG "origin/elina-el-capitan" CACHE STRING "apron tag to use")
   else ()
     set (APRON_TAG "origin/elina" CACHE STRING "apron tag to use")
   endif()
-  
   ExternalProject_Add(apron
     GIT_REPOSITORY https://github.com/seahorn/elina.git
     GIT_TAG ${APRON_TAG}
@@ -174,6 +190,28 @@ if (GIT_FOUND)
     LOG_BUILD 1)
 else ()
   message (STATUS "Could not find git. Not downloading apron")
+endif()
+endif()
+
+
+if (USE_ELINA)
+if (GIT_FOUND)
+  set (ELINA_TAG "master" CACHE STRING "elina tag to use")
+  ExternalProject_Add(elina
+    GIT_REPOSITORY https://github.com/eth-sri/ELINA.git
+    GIT_TAG ${ELINA_TAG}
+    INSTALL_DIR ${CMAKE_BINARY_DIR}/run/elina
+    CONFIGURE_COMMAND ./configure -prefix ${INSTALL_DIR} -use-vector  -gmp-prefix ${GMP_SEARCH_PATH} -mpfr-prefix ${MPFR_SEARCH_PATH} 
+    BUILD_IN_SOURCE 1
+    BUILD_COMMAND make CC=${CMAKE_C_COMPILER} CXX=${CMAKE_CXX_COMPILER} ${IS_VECTOR} ${IS_SSE}
+    ELINA_PREFIX=<INSTALL_DIR> GMP_PREFIX=${GMP_SEARCH_PATH} MPFR_PREFIX=${MPFR_SEARCH_PATH} 
+    INSTALL_COMMAND 
+    make ELINA_PREFIX=<INSTALL_DIR> GMP_PREFIX=${GMP_SEARCH_PATH} MPFR_PREFIX=${MPFR_SEARCH_PATH} install
+    LOG_CONFIGURE 1
+    LOG_INSTALL 1
+    LOG_BUILD 1)
+else ()
+  message (STATUS "Could not find git. Not downloading elina")
 endif()
 endif()
 
@@ -206,6 +244,20 @@ if (USE_APRON)
   endif()
 endif ()
 
+if (USE_ELINA)
+  find_package(Elina)
+  if (ELINA_FOUND)
+    include_directories (${ELINA_INCLUDE_DIR})
+    set (ELINA_LIBS ${ELINA_LIBRARY})
+    set (HAVE_ELINA TRUE)
+  else()
+    ExternalProject_Get_Property (elina INSTALL_DIR)
+    set (ELINA_ROOT ${INSTALL_DIR} CACHE FILEPATH "Forced location of elina" FORCE)
+    message (WARNING "No elina found. Run \n\tcmake --build . --target elina && cmake ${CMAKE_SOURCE_DIR}")
+    return()
+  endif()
+endif ()
+
 include_directories (${Crab_SOURCE_DIR}/include)
 
 if (USE_LDD)
@@ -220,6 +272,13 @@ if (USE_APRON)
   message (STATUS "The apron domains will be available")
 else ()
   message (STATUS "The apron domains will not be available")
+endif ()
+
+if (USE_ELINA)
+  set_target_properties(elina PROPERTIES EXCLUDE_FROM_ALL ON)
+  message (STATUS "The elina domains will be available")
+else ()
+  message (STATUS "The elina domains will not be available")
 endif ()
 
 if (NOT USE_STATS)
@@ -284,6 +343,7 @@ endif ()
 set (CRAB_DEPS_LIBS
   ${LDD_LIBRARY} 
   ${APRON_LIBRARY}
+  ${ELINA_LIBRARY}
   ${MPFR_LIBRARIES} 
   ${GMPXX_LIB} 
   ${GMP_LIB})
@@ -303,6 +363,10 @@ else ()
   if (APRON_FOUND)
      set (_CRAB_INCLUDE_DIRS ${_CRAB_INCLUDE_DIRS} ${APRON_INCLUDE_DIR})
   endif ()
+  if (ELINA_FOUND)
+     set (_CRAB_INCLUDE_DIRS ${_CRAB_INCLUDE_DIRS} ${ELINA_INCLUDE_DIR})
+  endif ()
+   
   set (CRAB_INCLUDE_DIRS ${_CRAB_INCLUDE_DIRS} PARENT_SCOPE)  
 endif ()  
   
@@ -319,9 +383,37 @@ if (ENABLE_TESTS)
 endif ()
 
 install(DIRECTORY include/
-        DESTINATION include
+        DESTINATION crab/include
         PATTERN "config.h.cmake" EXCLUDE)
-install(FILES ${CMAKE_BINARY_DIR}/include/crab/config.h DESTINATION include/crab)
+install(FILES ${CMAKE_BINARY_DIR}/include/crab/config.h DESTINATION crab/include/crab)
+
+if (USE_LDD)
+  ExternalProject_Get_Property (ldd INSTALL_DIR)  
+  install(DIRECTORY ${INSTALL_DIR}
+         DESTINATION .)
+endif()
+
+if (USE_APRON)
+  ExternalProject_Get_Property (apron INSTALL_DIR)  
+  install(DIRECTORY ${INSTALL_DIR}
+          DESTINATION .)
+endif()
+
+if (USE_ELINA)
+  ExternalProject_Get_Property (elina INSTALL_DIR)  
+  install(DIRECTORY ${INSTALL_DIR}
+    DESTINATION .)
+
+  if (NOT TopLevel)
+    ## This is ugly fix so that seahorn and crab-llvm can find elina's
+    ## shared libraries. It has to do with how CMAKE_INSTALL_RPATH is
+    ## handled by these tools.
+    foreach(library ${ELINA_LIBRARY})
+      get_filename_component(library_name ${library} NAME_WE)
+      file(COPY ${library} DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
+    endforeach(library)	
+  endif()
+endif ()
 
 if (TopLevel)
    install(FILES LICENSE DESTINATION .)

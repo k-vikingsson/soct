@@ -244,9 +244,6 @@ namespace crab {
       bool is_int_cast () const { 
         return (m_stmt_code == INT_CAST); 
       }
-      bool is_return () const { 
-        return m_stmt_code == RETURN; 
-      }
       bool is_havoc () const { 
         return m_stmt_code == HAVOC; 
       }
@@ -294,6 +291,12 @@ namespace crab {
       }      
       bool is_bool_select () const { 
         return (m_stmt_code == BOOL_SELECT); 
+      }
+      bool is_callsite() const {
+	return (m_stmt_code == CALLSITE);
+      }
+      bool is_return() const {
+	return (m_stmt_code == RETURN);
       }
       
      public:
@@ -537,9 +540,8 @@ namespace crab {
             (boost::make_shared<havoc_t>(m_lhs));
       }
       
-      void write (crab_os& o) const
-      {
-        o << m_lhs << " =*" << " "; // << this->m_live;
+      void write (crab_os& o) const {
+	o << "havoc(" << m_lhs << ")";
         return;
       }
     }; 
@@ -655,7 +657,10 @@ namespace crab {
       
       virtual void write (crab_os & o) const
       {
-        o << "assert (" << m_cst << ")"; 
+        o << "assert (" << m_cst << ")";
+	if (this->m_dbg_info.has_debug()) {
+	  o << " // line=" << this->m_dbg_info.m_line << " column=" << this->m_dbg_info.m_col;  
+	}
         return;
       }
     }; 
@@ -869,7 +874,7 @@ namespace crab {
       virtual void write(crab_os& o) const
       {
         o << "array_store(" 
-          << m_arr << "," << m_index << "," << m_value 
+          << m_arr << "," << m_index << "," << m_value  << ",sz=" << elem_size()
           << ")"; 
         return;
       }
@@ -939,7 +944,7 @@ namespace crab {
       
       virtual void write(crab_os& o) const {
         o << m_lhs << " = " 
-          << "array_load(" << m_array << "," << m_index  << ")"; 
+          << "array_load(" << m_array << "," << m_index  << ",sz=" << elem_size() << ")"; 
         return;
       }
     }; 
@@ -3698,20 +3703,23 @@ namespace crab {
       
       static size_t hash(callsite_t cs) {
 	size_t res = boost::hash_value(cs.get_func_name());
-        for (auto vt: cs.get_lhs ())
-          boost::hash_combine(res, vt.get_type());
-        for(unsigned i=0; i<cs.get_num_args (); i++)
+	for(unsigned i=0; i<cs.get_num_args (); i++) {
           boost::hash_combine(res, cs.get_arg_type (i));
+	}
+        for (auto vt: cs.get_lhs ()) {
+          boost::hash_combine(res, vt.get_type());
+	}
         return res;
       }
       
       static size_t hash(fdecl_t d)  {
         size_t res = boost::hash_value(d.get_func_name ());
-        for(unsigned i=0; i<d.get_num_inputs (); i++)
+        for(unsigned i=0; i<d.get_num_inputs (); i++) {
           boost::hash_combine(res, d.get_input_type (i));
-        for(unsigned i=0; i<d.get_num_outputs (); i++)
+	}
+	for(unsigned i=0; i<d.get_num_outputs (); i++) {
           boost::hash_combine(res, d.get_output_type (i));
-	
+	}
         return res;
       }      
     };

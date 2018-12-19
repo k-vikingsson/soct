@@ -14,7 +14,6 @@ namespace crab {
    namespace domains {
       typedef enum { APRON_INT, 
                      APRON_OCT, 
-                     APRON_OPT_OCT, 
                      APRON_PK } apron_domain_id_t;
    }
 }
@@ -37,6 +36,7 @@ namespace crab {
         using typename abstract_domain_t::linear_expression_t;
         using typename abstract_domain_t::linear_constraint_t;
         using typename abstract_domain_t::linear_constraint_system_t;
+	using typename abstract_domain_t::disjunctive_linear_constraint_system_t;
         using typename abstract_domain_t::variable_t;
         using typename abstract_domain_t::number_t;
         using typename abstract_domain_t::varname_t;
@@ -130,7 +130,10 @@ namespace crab {
         
         linear_constraint_system_t to_linear_constraint_system ()
         { CRAB_ERROR (APRON_NOT_FOUND); }
-        
+
+        disjunctive_linear_constraint_system_t to_disjunctive_linear_constraint_system ()
+        { CRAB_ERROR (APRON_NOT_FOUND); }
+	
         void write(crab_os& o) 
         { CRAB_ERROR (APRON_NOT_FOUND); }
           
@@ -165,6 +168,7 @@ namespace crab {
         using typename abstract_domain_t::linear_expression_t;
         using typename abstract_domain_t::linear_constraint_t;
         using typename abstract_domain_t::linear_constraint_system_t;
+	using typename abstract_domain_t::disjunctive_linear_constraint_system_t;	
         using typename abstract_domain_t::variable_t;
         using typename abstract_domain_t::number_t;
         using typename abstract_domain_t::varname_t;
@@ -187,7 +191,6 @@ namespace crab {
             switch (ApronDom) {
               case APRON_INT: m_apman = box_manager_alloc (); break;
               case APRON_OCT: m_apman = oct_manager_alloc (); break;
-              case (APRON_OPT_OCT): m_apman = opt_oct_manager_alloc (); break;
               case APRON_PK: m_apman = pk_manager_alloc (false); break;
               default: CRAB_ERROR("unknown apron domain");
             }
@@ -561,7 +564,7 @@ namespace crab {
               res =  linear_constraint_t (e, linear_constraint_t::kind_t::STRICT_INEQUALITY);
               break;
             case AP_CONS_EQMOD:
-              res = T ();
+              res = linear_constraint_t::get_true();
               break;
             case AP_CONS_DISEQ:
               // e != k
@@ -569,16 +572,6 @@ namespace crab {
               break;
           }
           return res;
-        }
-
-        inline linear_constraint_t T () const {
-          return linear_constraint_t (linear_expression_t (Number(1)) == 
-                                      linear_expression_t (Number(1)));          
-        }
-
-        inline linear_constraint_t F () const {
-          return linear_constraint_t (linear_expression_t (Number(1)) == 
-                                      linear_expression_t (Number(0)));          
         }
 
         void dump (const var_map_t& m, ap_state_ptr apstate ) {  
@@ -603,6 +596,46 @@ namespace crab {
 
         void dump () { dump (m_var_map, m_apstate); }
 
+	// x != n
+	void inequalities_from_disequation(variable_t x, number_t n, linear_constraint_system_t& out) {
+	  interval_t i = this->operator[](x);
+	  interval_t new_i =
+	    linear_interval_solver_impl::trim_interval<interval_t>(i, interval_t(n));
+	  if (new_i.is_bottom()) {
+	    out += linear_constraint_t::get_false();
+	  } else if (!new_i.is_top() && (new_i <= i)) {
+	    if(new_i.lb().is_finite()) {
+	      // strenghten lb
+	      out += linear_constraint_t(x >= *(new_i.lb().number()));
+	}
+	    if(new_i.ub().is_finite()) {
+	      // strenghten ub
+	      out += linear_constraint_t(x <= *(new_i.ub().number()));	  
+	    }
+	  }
+	} 
+	
+	interval_t compute_residual(linear_expression_t e, variable_t pivot) {
+	  interval_t residual(-e.constant());
+	  for (typename linear_expression_t::iterator it = e.begin(); it != e.end(); ++it) {
+	    variable_t v = it->second;
+	    if (v.index() != pivot.index()) {
+	      residual = residual - (interval_t (it->first) * this->operator[](v));
+	    }
+	  }
+	  return residual;
+	}
+	
+	void inequalities_from_disequation(linear_expression_t e, linear_constraint_system_t& o) {
+	  for (typename linear_expression_t::iterator it = e.begin(); it != e.end(); ++it) {
+	    variable_t pivot = it->second;
+	    interval_t i = compute_residual(e, pivot) / interval_t(it->first);
+	    if (auto k = i.singleton()) {
+	      inequalities_from_disequation(pivot, *k, o);
+	    }
+	  }
+	}
+	
        public:
         void print_stats () { ap_abstract0_fprint (stdout, get_man (), &*m_apstate, NULL); }
 
@@ -872,13 +905,9 @@ namespace crab {
             var_map_t  m = merge_var_map (m_var_map, x, o.m_var_map, o.m_apstate);
             switch (ApronDom) {
               case APRON_OCT:
-                return apron_domain_t (apPtr (get_man(), 
-                                              ap_abstract0_oct_narrowing (get_man(),
-                                                                          &*x, &*o.m_apstate)), m);
-              case APRON_OPT_OCT:
-                return apron_domain_t (apPtr (get_man(), 
-                                              ap_abstract0_opt_oct_narrowing (get_man(),
-                                                                              &*x, &*o.m_apstate)), m);
+                return apron_domain_t(apPtr(get_man(), 
+					    ap_abstract0_oct_narrowing(get_man(),
+								       &*x, &*o.m_apstate)), m);
               case APRON_INT:
               case APRON_PK:
               default:
@@ -1089,34 +1118,43 @@ namespace crab {
 	    return;
 	  }
 
-	  // XXX: filter out unsigned linear inequalities
+	  if (_csts.is_true()) {
+	    return;
+	  }
+	  
+	  // XXX: filter out unsigned linear inequalities, and analyze
+	  //      separately disequalities because apron does not seem
+	  //      to support them.
+	  
 	  linear_constraint_system_t csts;
-	  bool has_disequality = false;
 	  for (auto const& c: _csts) {
 	    if (c.is_inequality() && c.is_unsigned()) {
 	      CRAB_WARN("unsigned inequality skipped");
 	      continue;
 	    }
-	    if (c.is_disequation()) {
-	      has_disequality = true;
-	    }
-	    csts += c;
-	  }
-
-	  if (has_disequality) {
-	    // trivial reduction between the apron domain and
-	    // intervals. This is done because most of the apron
-	    // domains ignore disequalities. Of course, more things
-	    // can be done here to improve precision.
-	    interval_domain_t intvs;
-	    intvs = to_interval_domain();
-	    intvs += csts;
-	    if (intvs.is_bottom()) {
-	      *this = bottom ();
-	      return;
+	    if (c.is_strict_inequality()) {
+	      // We try to convert a strict to non-strict.
+	      csts += linear_constraint_impl::strict_to_non_strict_inequality(c);
+	    } else if (c.is_disequation()) {
+	      // We try to convert a disequation into conjunctive
+	      // inequalities	      
+	      inequalities_from_disequation(c.expression(), csts);
+	    } else {
+	      csts += c;
 	    }
 	  }
-
+	  
+	  if (csts.is_false()) {
+	    // csts can be false after breaking disequalities into
+	    // inequalities
+	    *this = bottom();
+	    return;
+	  }
+	  
+	  if (csts.is_true()) {
+	    return;
+	  }
+	  
           ap_tcons0_array_t array = ap_tcons0_array_make (csts.size ());
           unsigned i=0;
 
@@ -1471,10 +1509,10 @@ namespace crab {
         linear_constraint_system_t to_linear_constraint_system () {
           linear_constraint_system_t csts;
           if(is_bottom ())  {
-            csts += F ();
+            csts += linear_constraint_t::get_false();
           }
           else if(is_top ()) {
-            csts += T ();
+            csts += linear_constraint_t::get_true();
           }
           else {
             normalize ();
@@ -1489,6 +1527,17 @@ namespace crab {
           return csts;
         }
 
+      disjunctive_linear_constraint_system_t to_disjunctive_linear_constraint_system() {
+	auto lin_csts = to_linear_constraint_system();
+	if (lin_csts.is_false()) {
+	  return disjunctive_linear_constraint_system_t(true /*is_false*/); 
+	} else if (lin_csts.is_true()) {
+	  return disjunctive_linear_constraint_system_t(false /*is_false*/);
+	} else {
+	  return disjunctive_linear_constraint_system_t(lin_csts);
+	}
+      }
+	
       void rename(const variable_vector_t &from, const variable_vector_t &to) {
 	if (is_top () || is_bottom()) return;
 	
@@ -1560,7 +1609,6 @@ namespace crab {
           switch (ApronDom) {
             case APRON_INT:     return "ApronIntervals"; 
             case APRON_OCT:     return "ApronOctagon"; 
-            case APRON_OPT_OCT: return "ApronOptimizedOctagon"; 
             case APRON_PK:      return "ApronNewPolka";
             default: CRAB_ERROR("Unknown apron domain");
           }
@@ -1585,6 +1633,7 @@ namespace crab {
         using typename abstract_domain_t::linear_expression_t;
         using typename abstract_domain_t::linear_constraint_t;
         using typename abstract_domain_t::linear_constraint_system_t;
+	using typename abstract_domain_t::disjunctive_linear_constraint_system_t;	
         using typename abstract_domain_t::variable_t;
         using typename abstract_domain_t::number_t;
         using typename abstract_domain_t::varname_t;
@@ -1732,6 +1781,10 @@ namespace crab {
         linear_constraint_system_t to_linear_constraint_system () {
           return ref().to_linear_constraint_system();
         }
+        disjunctive_linear_constraint_system_t to_disjunctive_linear_constraint_system () {
+          return ref().to_disjunctive_linear_constraint_system();
+        }
+	
         static std::string getDomainName () {
 	  return apron_domain_impl_t::getDomainName();
 	}

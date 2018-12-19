@@ -353,6 +353,11 @@ namespace ikos {
         o << this->_cst;
       }
     }
+
+    // for dgb
+    void dump() {
+      write(crab::outs());
+    }
     
   }; // class linear_expression
 
@@ -523,16 +528,20 @@ namespace ikos {
     // By default all constraints are signed.
     bool _signedness;
 
-    linear_constraint(const linear_expression_t &expr, kind_t kind, bool signedness)
-      : _kind(kind), _expr(expr), _signedness(signedness) { }    
-
-    
   public:
+    
     linear_constraint(): _kind(EQUALITY), _signedness(true) { }
     
     linear_constraint(const linear_expression_t &expr, kind_t kind)
       : _kind(kind), _expr(expr), _signedness(true) { }    
 
+    linear_constraint(const linear_expression_t &expr, kind_t kind, bool signedness)
+      : _kind(kind), _expr(expr), _signedness(signedness) {
+      if (_kind != INEQUALITY && _kind != STRICT_INEQUALITY) {
+	CRAB_ERROR("Only inequalities can have signedness information");
+      }
+    }    
+    
     static linear_constraint_t get_true () {
       linear_constraint_t res(linear_expression_t(Number(0)), EQUALITY);
       return res;
@@ -670,33 +679,7 @@ namespace ikos {
       return this->_expr.variables();
     }
 
-    linear_constraint_t negate () const {
-      if (is_tautology ())
-	return get_false();
-      else if (is_contradiction ())
-	return get_true();
-      else {
-        switch (kind ()) {
-          case INEQUALITY: {
-	    // WARNING: it assumes integer arithmetic
-	    // negate(x + y <= 0) <-->  x + y > 0 <--> -x -y < 0 <--> -x-y <= -1 (if integer)
-            linear_expression_t e = -(this->_expr - 1);
-            return linear_constraint_t (e, INEQUALITY, is_signed());
-          }
-          case STRICT_INEQUALITY: {
-	    // negate(x + y < 0)  <-->  x + y >= 0 <--> -x -y <= 0
-            linear_expression_t e = -this->_expr;
-            return linear_constraint_t (e, INEQUALITY, is_signed());
-          }
-          case EQUALITY:
-            return linear_constraint_t (this->_expr, DISEQUATION);
-          case DISEQUATION: 
-            return linear_constraint_t (this->_expr, EQUALITY);
-          default: ;;             
-        }
-      }
-      CRAB_ERROR("unreachable");       
-    }
+    linear_constraint_t negate() const;
 
     template<typename VarMap>
     boost::optional<linear_constraint_t> rename(const VarMap& map) const {
@@ -748,10 +731,95 @@ namespace ikos {
         o << c;
       }
     }
-    
+
+    // for dgb
+    void dump() {
+      write(crab::outs());
+    }
     
   }; // class linear_constraint
 
+  namespace linear_constraint_impl{
+    
+    template<typename Number, typename VariableName>
+    linear_constraint<Number, VariableName>
+    negate_inequality(const linear_constraint<Number, VariableName>& c) {
+      typedef linear_expression<Number, VariableName> linear_expression_t;
+      typedef linear_constraint<Number, VariableName> linear_constraint_t;
+      assert(c.is_inequality());
+      // default implementation: negate(e <= 0) = e > 0 
+      linear_expression_t e(-c.expression());
+      return linear_constraint_t(e, linear_constraint_t::kind_t::STRICT_INEQUALITY,
+				 c.is_signed());
+    }
+
+    // Specialized version for z_number
+    template<typename VariableName>
+    linear_constraint<z_number, VariableName>
+    negate_inequality(const linear_constraint<z_number, VariableName>& c) {
+      typedef linear_expression<z_number, VariableName> linear_expression_t;
+      typedef linear_constraint<z_number, VariableName> linear_constraint_t;
+      assert(c.is_inequality());
+      // negate(e <= 0) = e >= 1
+      linear_expression_t e(-(c.expression() - 1));  
+      return linear_constraint_t (e, linear_constraint_t::kind_t::INEQUALITY, c.is_signed());
+    }
+
+    template<typename Number, typename VariableName>
+    linear_constraint<Number, VariableName>
+    strict_to_non_strict_inequality(const linear_constraint<Number, VariableName>& c) {
+      typedef linear_constraint<Number, VariableName> linear_constraint_t;      
+      assert(c.is_strict_inequality());
+      // Default implementation: do nothing
+      // Given constraint e < 0 we could return two linear constraints: e <= 0 and e != 0.
+      // The linear interval solver lowers strict inequalities in that way.
+      return c;
+    }
+
+    // Specialized version for z_number
+    template<typename VariableName>
+    linear_constraint<z_number, VariableName>
+    strict_to_non_strict_inequality(const linear_constraint<z_number, VariableName>& c) {
+      typedef linear_expression<z_number, VariableName> linear_expression_t;            
+      typedef linear_constraint<z_number, VariableName> linear_constraint_t;
+      assert(c.is_strict_inequality());
+      // e < 0 --> e <= -1
+      linear_expression_t e(c.expression() + 1); 
+      return linear_constraint_t(e, linear_constraint_t::kind_t::INEQUALITY, c.is_signed());
+    }
+  } // end namespace linear_constraint_impl
+
+  template<typename Number, typename VariableName>
+  linear_constraint<Number, VariableName>
+  linear_constraint<Number,VariableName>::negate() const {
+    typedef linear_constraint<Number,VariableName> linear_constraint_t;
+    typedef linear_expression<Number,VariableName> linear_expression_t;
+    
+    if (is_tautology ()) {
+      return get_false();
+    } else if (is_contradiction ()) {
+      return get_true();
+    } else {
+      switch (kind ()) {
+      case INEQUALITY: {
+	// negate_inequality tries to take advantage if we use z_number.
+	return linear_constraint_impl::negate_inequality(*this);
+      }
+      case STRICT_INEQUALITY: {
+	// negate(x + y < 0)  <-->  x + y >= 0 <--> -x -y <= 0
+	linear_expression_t e = -this->_expr;
+	return linear_constraint_t (e, INEQUALITY, is_signed());
+      }
+      case EQUALITY:
+	return linear_constraint_t (this->_expr, DISEQUATION);
+      case DISEQUATION: 
+	return linear_constraint_t (this->_expr, EQUALITY);
+      default:
+	CRAB_ERROR("Cannot negate linear constraint");       
+      }
+    }
+  }
+  
   template<typename Number, typename VariableName>
   inline std::size_t hash_value(const linear_constraint<Number,VariableName>& e) {
     return e.hash ();
@@ -1372,6 +1440,10 @@ namespace ikos {
       }
       return true; // all constraints are false
     }
+
+    bool is_true() const {
+      return _csts.empty();
+    }
     
     std::size_t size() const { return _csts.size(); }
         
@@ -1388,10 +1460,15 @@ namespace ikos {
       o << "}";
     }
 
+    // for dgb
+    void dump() {
+      write(crab::outs());
+    }
+    
   }; // class linear_constraint_system
 
 
-  // This class contains a disjunction of linear constraints
+  // This class contains a disjunction of linear constraints (i.e., DNF form)
   template< typename Number, typename VariableName >
   class disjunctive_linear_constraint_system: public writeable {
 
@@ -1410,10 +1487,10 @@ namespace ikos {
   public:
     typedef typename cst_collection_t::const_iterator iterator;
 
-    disjunctive_linear_constraint_system()
-      : _is_false (false) {}
+    disjunctive_linear_constraint_system(bool is_false = false)
+      : _is_false (is_false) {}
 
-    disjunctive_linear_constraint_system(const linear_constraint_system_t &cst)
+    explicit disjunctive_linear_constraint_system(const linear_constraint_system_t &cst)
       : _is_false (false) {
       if (cst.is_false ()) {
 	_is_false = true;
@@ -1423,36 +1500,63 @@ namespace ikos {
     }
 
     disjunctive_linear_constraint_system(const this_type &o)
-        : _csts (o._csts) { }
+      : _csts (o._csts)
+      , _is_false(o._is_false) { }
 
     disjunctive_linear_constraint_system(this_type &&o)
-        : _csts (std::move(o._csts)) { }
+      : _csts (std::move(o._csts))
+      , _is_false(o._is_false) { }
 
     bool is_false () const {
       return _is_false;
     }
-    
+
+    bool is_true () const {
+      return (!is_false() && _csts.empty());
+    }
+
+    // make true
+    void clear() {
+      _is_false = false;
+      _csts.clear();
+    }
+
+    /*
+      c1 or ... or cn  += true  ==> error
+      c1 or ... or cn  += false ==> c1 or .. or cn
+      c1 or ... or cn  += c     ==> c1 or ... or cn or c
+    */
     this_type& operator+=(const linear_constraint_system_t &cst) {
-      if (_csts.empty () && cst.is_false ()) {
-	_is_false = true;
-      } else {
+      if (cst.is_true()) {
+	// adding true should make the whole thing true
+	// but we prefer to raise an error for now.
+	CRAB_ERROR("Disjunctive linear constraint: cannot add true");	
+      }
+
+      if (!cst.is_false()) {
 	_csts.push_back(cst);
 	_is_false = false;
       }
       return *this;
     }
 
+    /*
+      c1 or ... or cn  += true  ==> error
+      c1 or ... or cn  += false ==> c1 or .. or cn
+      c1 or ... or cn  += d1 or ... or dn   ==> c1 or ... or cn or d1 or ... or dn
+    */
     this_type& operator+=(const this_type &s) {
-      if (this->is_false ()) {
-	return s;
-      } else if (s.is_false ()) {
-	return *this;
-      } else { 
-	for (auto c: s) {
-	  _csts.push_back(c);
-	}
-	return *this;
+      if (s.is_true()) {
+	// adding true should make the whole thing true
+	// but we prefer to raise an error for now.
+	CRAB_ERROR("Disjunctive linear constraint: cannot add true");
       }
+      if (!s.is_false()) {
+	for (const linear_constraint_system_t& c: s) {
+	  this->operator+=(c);
+	}
+      }
+      return *this;
     }
 
     this_type operator+(const this_type &s) const {
@@ -1481,7 +1585,7 @@ namespace ikos {
     void write(crab::crab_os& o) {
       if (is_false ()) {
 	o << "_|_";
-      } else if (_csts.empty ()) {
+      } else if (is_true()) {
 	o << "{}";
       } else if (size () == 1) {
 	o << _csts[0];

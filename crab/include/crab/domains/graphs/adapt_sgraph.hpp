@@ -498,6 +498,7 @@ namespace crab {
     // Management
     bool is_empty(void) const { return edge_count == 0; }
     size_t size(void) const { return _succs.size(); }
+    size_t num_edges(void) const { return edge_count;}
     vert_id new_vertex(void) {
       vert_id v;
       if(free_id.size() > 0)
@@ -623,19 +624,14 @@ namespace crab {
     template<class Op>
     void update_edge(vert_id s, Wt w, vert_id d, Op& op)
     {
-        CRAB_LOG("octagon-assign", crab::outs() << "Updating edge: " << s << " -> " << d <<" = "<<w <<"\n");
       size_t idx;
       if(_succs[s].lookup(d, &idx))
       {
-          CRAB_LOG("octagon-assign", crab::outs() << "edge exists, idx: " << idx <<"\n");
         _ws[idx] = op.apply(_ws[idx], w);
       } else {
-          
         if(!op.default_is_absorbing())
           add_edge(s, w, d);
-        CRAB_LOG("octagon-assign", crab::outs() << "Added_edge "<<"\n");
       }
-      CRAB_LOG("octagon-assign", crab::outs() << "Edge updated"<<"\n");
     }
 
     void set_edge(vert_id s, Wt w, vert_id d)

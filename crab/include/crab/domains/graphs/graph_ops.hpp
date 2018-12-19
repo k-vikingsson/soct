@@ -625,7 +625,7 @@ namespace crab {
 
     G& g;
   };
-
+  
   // Viewing a graph with all edges reversed.
   // Useful if we want to run single-dest shortest paths,
   // for updating bounds and incremental closure.
@@ -1064,9 +1064,9 @@ r_not_dom:
         {
           char mark = 0;
           vert_id d = e.vert;
-          if(l.lookup(s, d, &w) && w == e.val)
+          if(l.lookup(s, d, &w) && w.get() == e.val)
             mark |= E_LEFT;
-          if(r.lookup(s, d, &w) && w == e.val)
+          if(r.lookup(s, d, &w) && w.get() == e.val)
             mark |= E_RIGHT;
           // Add them to the appropriate coloured successor list 
           // Could do it inline, but this'll do.
@@ -1118,8 +1118,15 @@ r_not_dom:
         for(std::pair< std::pair<vert_id, vert_id>, Wt>& e : delta) {
         
             //if (!is_oct || e.first.first/2 != e.first.second/2) {
-            if (!g.lookup(e.first.first, e.first.second, &w) || w > e.second){
-                g.set_edge(e.first.first, e.second, e.first.second);
+            CRAB_LOG("octagon-assign", crab::outs() << "Applied graph" << g <<"\n");
+            CRAB_LOG("octagon-assign", crab::outs() << "Applying delta: (" << e.first.first << ", " << e.first.second << ") = "<< e.second <<"\n");
+            if (!g.lookup(e.first.first, e.first.second, &w) || e.second < w){
+                CRAB_LOG("octagon-assign", crab::outs() << "Applying delta w: "<< w <<"\n");
+                //if (){
+                    
+                g.set_edge(e.first.first, Wt(e.second), e.first.second);
+                CRAB_LOG("octagon-assign", crab::outs() << "Applying delta set\n");
+                
             }
         }
     }
@@ -1160,7 +1167,7 @@ r_not_dom:
         int es = heap.removeMin();
         Wt es_cost = dists[es] + p[es]; // If it's on the queue, distance is not infinite.
         Wt es_val = es_cost - p[src];
-        if(!g.lookup(src, es, &w) || w > es_val)
+        if(!g.lookup(src, es, &w) || w.get() > es_val)
           out.push_back( std::make_pair(es, es_val) );
 
         for(auto e_ed : g.e_succs(es))
@@ -1234,7 +1241,7 @@ r_not_dom:
         int es = heap.removeMin();
         Wt es_cost = dists[es] + p[es]; // If it's on the queue, distance is not infinite.
         Wt es_val = es_cost - p[src];
-        if(!g.lookup(src, es, &w) || w > es_val)
+        if(!g.lookup(src, es, &w) || w.get() > es_val)
           out.push_back( std::make_pair(es, es_val) );
 
         if(vert_marks[es] == (E_LEFT|E_RIGHT))
@@ -1306,7 +1313,7 @@ r_not_dom:
         int es = heap.removeMin();
         Wt es_cost = dists[es] + p[es]; // If it's on the queue, distance is not infinite.
         Wt es_val = es_cost - p[src];
-        if(!g.lookup(src, es, &w) || w > es_val)
+        if(!g.lookup(src, es, &w) || w.get() > es_val)
           out.push_back( std::make_pair(es, es_val) );
 
         if(vert_marks[es] == V_STABLE)
