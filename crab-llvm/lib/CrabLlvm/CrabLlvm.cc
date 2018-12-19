@@ -10,6 +10,7 @@
 #include "llvm/Transforms/Utils/UnifyFunctionExitNodes.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/CallGraph.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/CommandLine.h"
@@ -21,8 +22,18 @@
 #include "crab_llvm/wrapper_domain.hh"
 #include "crab_llvm/CrabLlvm.hh"
 #include "crab_llvm/CfgBuilder.hh"
-#include "crab_llvm/HeapAbstraction.hh"
 #include "crab_llvm/Support/NameValues.hh"
+/** Wrappers for pointer analyses **/
+#include "crab_llvm/DummyHeapAbstraction.hh"
+#include "crab_llvm/LlvmDsaHeapAbstraction.hh"
+#include "crab_llvm/SeaDsaHeapAbstraction.hh"
+/** Actual pointer analysis for heap disambiguation **/
+// llvm-dsa
+#ifdef HAVE_DSA
+#include "dsa/Steensgaard.hh"
+#endif
+// sea-dsa
+#include "sea_dsa/Global.hh"
 
 #include "crab/common/debug.hpp"
 #include "crab/common/stats.hpp"
@@ -36,22 +47,16 @@
 #include "crab/checkers/checker.hpp"
 #include "crab/cg/cg.hpp"
 #include "crab/cg/cg_bgl.hpp"
+#include "./crab/path_analyzer.hpp"
 
 #include <boost/shared_ptr.hpp>
 #include <boost/unordered_map.hpp>
 #include <boost/unordered_set.hpp>
 #include <boost/range/iterator_range.hpp>
 #include <memory>
+#include <functional>
+#include <map>
 
-#ifdef HAVE_DSA
-#include "dsa/DSNode.h"
-#include "dsa/Steensgaard.hh"
-#endif 
-
-// Compile time can be slow due to template instantiation. We enable
-// by default this option to mitigate this problem by disabling some
-// abstract domains. Comment it out for compiling all domains.
-//#define FASTER_COMPILATION
 
 using namespace llvm;
 using namespace crab_llvm;
@@ -73,14 +78,19 @@ CrabPrintPreCond ("crab-print-preconditions",
                cl::init (false));
 
 cl::opt<bool>
+CrabStoreInvariants ("crab-store-invariants", 
+               cl::desc ("Store invariants"),
+               cl::init (true));
+
+cl::opt<bool>
 CrabStats ("crab-stats", 
            cl::desc ("Show Crab statistics and analysis results"),
            cl::init (false));
 
 cl::opt<bool>
-CrabPrintAssumptions ("crab-print-unjustified-assumptions", 
-	cl::desc ("Print unjustified assumptions done by Crab (for now only integer overflow)"),
-	cl::init (false));
+CrabPrintUnjustifiedAssumptions ("crab-print-unjustified-assumptions", 
+cl::desc ("Print unjustified assumptions done by Crab (experimental: only integer overflow)"),
+cl::init (false));
 
 cl::opt<unsigned int>
 CrabWideningDelay("crab-widening-delay", 
@@ -115,20 +125,19 @@ CrabLlvmDomain("crab-dom",
 		   "Disjunctive intervals based on ldds"),
        clEnumValN (ZONES_SPLIT_DBM, "zones",
 		   "Zones domain with Sparse DBMs in Split Normal Form"),
-       clEnumValN (OCTAGON_SPLIT, "soct",
-		   "Octagon domain with Sparse DBMs in Split Normal Form"),
-       clEnumValN (OPT_OCT_APRON, "oct",
-		   "Optimized octagons domain using Elina"),
-       clEnumValN (PK_APRON, "pk",
-		   "Polyhedra domain using Apron library"),
+       clEnumValN (OCT_SPLIT_DBM, "soct",
+		   "Octagons domain with Sparse DBMs in Split Normal Form"),
+       clEnumValN (OCT, "oct", "Octagons domain"),
+       clEnumValN (PK, "pk", "Polyhedra domain"),
        clEnumValN (TERMS_ZONES, "rtz",
 		   "Reduced product of term-dis-int and zones."),
+       clEnumValN (WRAPPED_INTERVALS, "w-int", "Wrapped interval domain"),       
        clEnumValEnd),
        cl::init (INTERVALS));
 
 cl::opt<bool>
 CrabBackward ("crab-backward", 
-           cl::desc ("Perform an iterative forward/backward analysis\n"
+           cl::desc ("Perform an iterative forward/backward analysis (very experimental)\n"
 		     "(Only intra-procedural version implemented)"),
            cl::init (false));
 
@@ -158,10 +167,9 @@ CrabSummDomain("crab-inter-sum-dom",
     cl::values 
     (clEnumValN (ZONES_SPLIT_DBM, "zones",
 		 "Zones domain with sparse DBMs in Split Normal Form"),
-     clEnumValN (OCTAGON_SPLIT, "soct",
-		   "Octagon domain with Sparse DBMs in Split Normal Form"),
-     clEnumValN (OPT_OCT_APRON, "oct",
-		 "Optimized octagons using Elina"),
+     clEnumValN (OCT_SPLIT_DBM, "soct",
+		 "Octagons domain with sparse DBMs in Split Normal Form"),
+     clEnumValN (OCT, "oct", "Octagons domain"),
      clEnumValN (TERMS_ZONES, "rtz",
 		 "Reduced product of term-dis-int and zones."),
      clEnumValEnd),
@@ -177,8 +185,17 @@ CrabTrackLev("crab-track",
      clEnumValEnd),
    cl::init (tracked_precision::NUM));
 
+cl::opt<enum heap_analysis_t>
+CrabHeapAnalysis("crab-heap-analysis",
+   cl::desc("Heap analysis used for memory disambiguation"),
+   cl::values
+    (clEnumValN(LLVM_DSA  , "llvm-dsa"  , "context-insensitive llvm dsa"),
+     clEnumValN(CI_SEA_DSA, "ci-sea-dsa", "context-insensitive sea dsa"),
+     clEnumValN(CS_SEA_DSA, "cs-sea-dsa", "context-sensitive sea dsa"),
+     clEnumValEnd),
+   cl::init(heap_analysis_t::LLVM_DSA));
 
-// llvm-dsa options
+// Specific llvm-dsa/sea-dsa options
 cl::opt<bool>
 CrabDsaDisambiguateUnknown ("crab-dsa-disambiguate-unknown",
     cl::desc ("Disambiguate unknown pointers (unsound)"), 
@@ -204,7 +221,7 @@ CrabCheck ("crab-check",
 	   cl::values(
 	       clEnumValN (NOCHECKS  , "none"  , "None"),
 	       clEnumValN (ASSERTION , "assert", "User assertions"),
-	       clEnumValN (NULLITY   , "null"  , "Null dereference"),
+	       clEnumValN (NULLITY   , "null"  , "Null dereference (unused/untested)"),
 	       clEnumValEnd),
 	   cl::init (assert_check_kind_t::NOCHECKS));
 
@@ -222,11 +239,28 @@ CrabKeepShadows ("crab-keep-shadows",
     cl::init (false),
     cl::Hidden);
 
+// In C++11 we need to pass to std::bind "this" (if class member
+// functions are called) as well as all placeholders for each
+// argument. This is wrapper to avoid that and improve readability.
+template <class C, typename Ret, typename ... Ts>
+static std::function<Ret(Ts...)> bind_this(C* c, Ret (C::*m)(Ts...)) {
+  return [=](Ts&&... args) { return (c->*m)(std::forward<decltype(args)>(args)...); };
+}
 
 namespace crab_llvm {
 
-  // TODO: refactoring inter-procedural analysis. Decouple the
-  // inter-procedural analysis from the llvm pass.
+  static crab::crab_os& get_crab_os(bool show_time = true) {
+    crab::crab_os* result = &crab::outs();
+    if (show_time) {
+      time_t now = time(0);
+      struct tm tstruct;
+      char buf[80];
+      tstruct = *localtime(&now);
+      strftime(buf, sizeof(buf), "[%Y-%m-%d.%X] ", &tstruct);
+      *result << buf;
+    }
+    return *result;
+  }
   
   using namespace crab::analyzer;
   using namespace crab::checker;
@@ -240,10 +274,8 @@ namespace crab_llvm {
   typedef DenseMap<const BasicBlock*, lin_cst_sys_t> assumption_map_t;
   typedef typename IntraCrabLlvm::wrapper_dom_ptr wrapper_dom_ptr;    
   typedef typename IntraCrabLlvm::checks_db_t checks_db_t;
-  typedef typename IntraCrabLlvm::checks_db_ptr checks_db_ptr;
   typedef typename IntraCrabLlvm::invariant_map_t invariant_map_t;
   typedef typename IntraCrabLlvm::heap_abs_ptr heap_abs_ptr;
-  typedef DenseMap<llvm::Function*, cfg_ptr_t> cfg_map_t;    
   /** End typedefs **/
   
   /** Begin global counters **/
@@ -252,8 +284,8 @@ namespace crab_llvm {
   /** End global counters **/
   
   static bool isRelationalDomain(CrabDomain dom) {
-    return (dom == ZONES_SPLIT_DBM || dom == OPT_OCT_APRON ||
-	    dom == PK_APRON        || dom == TERMS_ZONES || dom == OCTAGON_SPLIT);
+    return (dom == ZONES_SPLIT_DBM || dom == OCT || dom == OCT_SPLIT_DBM ||
+	    dom == PK || dom == TERMS_ZONES);
   }
 
   static bool isTrackable(const Function &fun) {
@@ -267,10 +299,10 @@ namespace crab_llvm {
     // invariants that hold at the exit of a block
     invariant_map_t &postmap;
     // database with all the checks
-    checks_db_ptr &checksdb;
+    checks_db_t &checksdb;
 
     InvarianceAnalysisResults(invariant_map_t &pre, invariant_map_t &post,
-			      checks_db_ptr &db)
+			      checks_db_t &db)
       : premap(pre), postmap(post), checksdb(db) {}
   };
 
@@ -399,17 +431,21 @@ namespace crab_llvm {
     };
 
     /** Annotation for unjustified assumptions done by the analysis **/
-    class assumption_annotation: public block_annotation {
+    class unjust_assumption_annotation: public block_annotation {
     private:
       typedef typename assumption_analysis<cfg_ref_t>::assumption_ptr assumption_ptr;
-      typedef assumption_analysis<cfg_ref_t> assumption_analysis_t;
+      
+    public:
+      typedef assumption_analysis<cfg_ref_t> unjust_assumption_analysis_t;
+      
+    private:
       typedef typename cfg_ref_t::statement_t statement_t;
       
       cfg_ref_t m_cfg;
-      assumption_analysis_t *m_analyzer;
+      unjust_assumption_analysis_t *m_analyzer;
       
     public:
-      assumption_annotation (cfg_ref_t cfg, assumption_analysis_t *analyzer)
+      unjust_assumption_annotation (cfg_ref_t cfg, unjust_assumption_analysis_t *analyzer)
 	: block_annotation(), m_cfg(cfg), m_analyzer(analyzer) { }
       
       std::string name() const { return "UNJUSTIFIED ASSUMPTIONS";}
@@ -421,8 +457,8 @@ namespace crab_llvm {
 	  m_analyzer->get_assumptions(static_cast<const assert_t *>(&s), assumes);
 	  if (!assumes.empty()) {
 	    o << "  /** assert verified as ";
-	    for (std::vector<assumption_ptr>::iterator it = assumes.begin(), et = assumes.end();
-		 it!=et;) {
+	    for (std::vector<assumption_ptr>::iterator it = assumes.begin(),
+		   et = assumes.end(); it!=et;) {
 	      o << (*it)->get_id_str();
 	      ++it;
 	      if (it != et)
@@ -532,18 +568,71 @@ namespace crab_llvm {
       dfs(cfg, f);
     }
   } //end namespace
+
+  static std::string dom_to_str(CrabDomain dom) {
+    switch (dom) {
+    case INTERVALS:             return interval_domain_t::getDomainName();
+    case INTERVALS_CONGRUENCES: return ric_domain_t::getDomainName();
+    case BOXES:                 return boxes_domain_t::getDomainName();
+    case DIS_INTERVALS:         return dis_interval_domain_t::getDomainName();
+    case ZONES_SPLIT_DBM:       return split_dbm_domain_t::getDomainName();
+    case OCT_SPLIT_DBM:         return split_oct_domain_t::getDomainName();
+    case TERMS_DIS_INTERVALS:   return term_dis_int_domain_t::getDomainName();
+    case TERMS_ZONES:           return num_domain_t::getDomainName();
+    case OCT:                   return oct_domain_t::getDomainName();
+    case PK:                    return pk_domain_t::getDomainName();
+    case WRAPPED_INTERVALS:     return wrapped_interval_domain_t::getDomainName();
+    default:                    return "none";
+    }
+  }
+  
+  std::string AnalysisParams::abs_dom_to_str() const {
+    return dom_to_str(dom);
+  }
+
+  std::string AnalysisParams::sum_abs_dom_to_str() const {
+    return dom_to_str(sum_dom);
+  }
+  
+  /* CFG Manager class */
+  CfgManager::CfgManager(){}
+  CfgManager::~CfgManager(){
+    for (auto &kv: m_cfg_map) {
+      delete kv.second;
+    }
+  }
+  
+  bool CfgManager::has_cfg(const Function &f) const {
+    return m_cfg_map.find(&f) != m_cfg_map.end();
+  }
+  
+  cfg_ref_t CfgManager::operator[](const Function &f) const {
+    assert(has_cfg(f));
+    
+    auto it = m_cfg_map.find(&f);
+    cfg_t *cfg = it->second;
+    return cfg_ref_t(*cfg);
+  }
+  
+  void CfgManager::add(const Function &f, cfg_t *cfg) {
+    if (!has_cfg(f)) {
+      m_cfg_map.insert(std::make_pair(&f, cfg));
+    }
+  }
   
   /**
    * Internal implementation of the intra-procedural analysis
    **/
   class IntraCrabLlvm_Impl {
     
-    cfg_ptr_t m_cfg;
+    cfg_t *m_cfg;
     Function &m_fun;
     llvm_variable_factory &m_vfac;
+    typename CfgBuilder::edge_to_bb_map_t m_edge_bb_map;
     
     template<typename Dom>
     void analyzeCfg(const AnalysisParams &params,
+		    const BasicBlock *entry,
 		    const assumption_map_t &assumptions, liveness_t *live,
 		    InvarianceAnalysisResults &results) {
       
@@ -557,10 +646,10 @@ namespace crab_llvm {
       CRAB_VERBOSE_IF(1,
 		      auto fdecl = m_cfg->get_func_decl ();            
 		      assert (fdecl);
-		      crab::outs() << "Running intra-procedural analysis with " 
-		                   << "\"" << Dom::getDomainName ()  << "\""
-		                   << " for "  << (*fdecl).get_func_name ()
-		                   << "  ... \n";);
+		      get_crab_os() << "Running intra-procedural analysis with " 
+		                    << "\"" << Dom::getDomainName ()  << "\""
+		                    << " for "  << (*fdecl).get_func_name ()
+		                    << "  ... \n";);
       
       // -- run intra-procedural analysis
       intra_analyzer_t analyzer (*m_cfg);
@@ -580,45 +669,62 @@ namespace crab_llvm {
 	// the program is safe.
 	post_cond = Dom::bottom();
       }
-      analyzer.run(Dom::top(), post_cond, !params.run_backward, crab_assumptions, live,
-		   params.widening_delay, params.narrowing_iters, params.widening_jumpset);
-      CRAB_VERBOSE_IF(1, crab::outs() << "Finished intra-procedural analysis.\n"); 
 
-      // -- store invariants 
-      for (basic_block_label_t bl: boost::make_iterator_range(m_cfg->label_begin(),
-							      m_cfg->label_end())) {
-	const BasicBlock *B = bl.get_basic_block();
-	if (!B) continue; // we only store those which correspond to llvm basic blocks
-
-	// --- invariants that hold at the entry of the blocks
-	auto pre = analyzer.get_pre (bl);
-	update(results.premap, *B,  mkGenericAbsDomWrapper(pre));
-	// --- invariants that hold at the exit of the blocks
-	auto post = analyzer.get_post (bl);
-	update(results.postmap, *B,  mkGenericAbsDomWrapper(post));	
-	if (params.stats) {
-	  unsigned num_block_invars = 0;
-	  // TODO CRAB: for boxes we would like to use
-	  // to_disjunctive_linear_constraint_system() but it needs to
-	  // be exposed to all domains
-	  num_block_invars += pre.to_linear_constraint_system().size();
-	  num_invars += num_block_invars;
-	  if (num_block_invars > 0) num_nontrivial_blocks++;
-	}
+      // We use as initial state an assumption if exists
+      Dom entry_dom = Dom::top();
+      auto it = crab_assumptions.find(entry);
+      if (it != crab_assumptions.end()) {
+	entry_dom = it->second;
       }
+      
+      analyzer.run(basic_block_label_t(entry), entry_dom, post_cond,
+		   !params.run_backward, crab_assumptions, live,
+		   params.widening_delay, params.narrowing_iters, params.widening_jumpset);
+      CRAB_VERBOSE_IF(1, get_crab_os() << "Finished intra-procedural analysis.\n"); 
 
+      // -- store invariants
+      if (params.store_invariants || params.print_invars) {
+	CRAB_VERBOSE_IF(1, get_crab_os() << "Storing invariants.\n");       
+	for (basic_block_label_t bl: boost::make_iterator_range(m_cfg->label_begin(),
+								m_cfg->label_end())) {
+	  const BasicBlock *B = bl.get_basic_block();
+	  if (!B) continue; // we only store those which correspond to llvm basic blocks
+	  
+	  // --- invariants that hold at the entry of the blocks
+	  auto pre = analyzer.get_pre (bl);
+	  update(results.premap, *B,  mkGenericAbsDomWrapper(pre));
+	  // --- invariants that hold at the exit of the blocks
+	  auto post = analyzer.get_post (bl);
+	  update(results.postmap, *B,  mkGenericAbsDomWrapper(post));	
+	  if (params.stats) {
+	    unsigned num_block_invars = 0;
+	    // TODO CRAB: for boxes we would like to use
+	    // to_disjunctive_linear_constraint_system() but it needs to
+	    // be exposed to all domains
+	    num_block_invars += pre.to_linear_constraint_system().size();
+	    num_invars += num_block_invars;
+	    if (num_block_invars > 0) num_nontrivial_blocks++;
+	  }
+	}
+	CRAB_VERBOSE_IF(1, get_crab_os() << "All invariants stored.\n");
+      }
+      
       // -- print all cfg annotations (if any)
       if (params.print_invars ||
 	  (params.print_preconds && params.run_backward) ||
-	  params.print_assumptions) {
+	  params.print_unjustified_assumptions) {
 
 	typedef pretty_printer_impl::block_annotation block_annotation_t;
 	typedef pretty_printer_impl::invariant_annotation inv_annotation_t;
 	typedef pretty_printer_impl::nec_precondition_annotation<intra_analyzer_t> pre_annotation_t;
-	typedef pretty_printer_impl::assumption_annotation assume_annotation_t;
+	typedef pretty_printer_impl::unjust_assumption_annotation unjust_assume_annotation_t;
 	std::vector<std::unique_ptr<block_annotation_t>> pool_annotations;
-	
-	llvm::outs() << "\n" << "function " << m_fun.getName() << "\n";
+
+	if (auto f_decl = m_cfg->get_func_decl()) {
+	  crab::outs() << "\n" << *f_decl << "\n";
+	} else {
+	  llvm::outs() << "\n" << "function " << m_fun.getName() << "\n";
+	}
 	if (params.print_invars) {
 	  pool_annotations.emplace_back(
 	       make_unique<inv_annotation_t>(m_vfac, results.premap, results.postmap, 
@@ -631,25 +737,24 @@ namespace crab_llvm {
 
 	// XXX: it must be alive when print_annotations is called.
 	#if 0
-	assumption_naive_analysis<cfg_ref_t> assumption_analyzer(*m_cfg);
+	assumption_naive_analysis<cfg_ref_t> unjust_assumption_analyzer(*m_cfg);
 	#else
-	assumption_dataflow_analysis<cfg_ref_t> assumption_analyzer(*m_cfg);
+	assumption_dataflow_analysis<cfg_ref_t> unjust_assumption_analyzer(*m_cfg);
 	#endif 
 	
-	if (params.print_assumptions) {
+	if (params.print_unjustified_assumptions) {
 	  // -- run first the analysis
-	  assumption_analyzer.exec();
+	  unjust_assumption_analyzer.exec();
 	  pool_annotations.emplace_back(
-	       make_unique<assume_annotation_t>(*m_cfg, &assumption_analyzer));
+	       make_unique<unjust_assume_annotation_t>(*m_cfg, &unjust_assumption_analyzer));
 	}
 
 	pretty_printer_impl::print_annotations(*m_cfg, pool_annotations);
       }
-    
-      
+          
       if (params.check) {
 	// --- checking assertions and collecting data
-	CRAB_VERBOSE_IF(1, crab::outs() << "Checking assertions ... \n"); 
+	CRAB_VERBOSE_IF(1, get_crab_os() << "Checking assertions ... \n"); 
 	typename intra_checker_t::prop_checker_ptr
 	  prop (new assert_prop_t (params.check_verbose));
 	if (params.check == NULLITY)
@@ -659,92 +764,142 @@ namespace crab_llvm {
 	CRAB_VERBOSE_IF(1,
 			llvm::outs() << "Function " << m_fun.getName() << "\n";
 			checker.show (crab::outs()));
-	if (!results.checksdb)
-	  results.checksdb = boost::make_shared<checks_db_t>();
-	(*results.checksdb) += checker.get_all_checks();
-	CRAB_VERBOSE_IF(1, crab::outs() << "Finished assert checking.\n");      
+	results.checksdb += checker.get_all_checks();
+	CRAB_VERBOSE_IF(1, get_crab_os() << "Finished assert checking.\n");      
       }
 
       
       return;
     }
 
-    void wrapperAnalyze(const AnalysisParams &params,
-			const assumption_map_t &assumptions, liveness_t *live,
-			InvarianceAnalysisResults &results) {
+    template<typename AbsDom>
+    void wrapperPathAnalyze(const std::vector<llvm_basic_block_wrapper>& path,
+			    std::vector<crab::cfg::statement_wrapper>& core,
+			    bool layered_solving, bool populate_maps,
+			    invariant_map_t& post, invariant_map_t& pre, bool &res) {
       
-      switch (params.dom) {
-      #ifndef FASTER_COMPILATION
-      case INTERVALS_CONGRUENCES:
-	analyzeCfg<ric_domain_t>(params, assumptions, live, results);
-        break;
-      case DIS_INTERVALS:
-	analyzeCfg<dis_interval_domain_t>(params, assumptions, live, results);
-        break;
-      case TERMS_INTERVALS:
-	analyzeCfg<term_int_domain_t>(params, assumptions, live, results);
-        break;
-      #endif 
-      case TERMS_DIS_INTERVALS:
-	analyzeCfg<term_dis_int_domain_t>(params, assumptions, live, results);
-        break;
-      case ZONES_SPLIT_DBM:
-	analyzeCfg<split_dbm_domain_t>(params, assumptions, live, results);
-        break;
-      case OCTAGON_SPLIT:
-	analyzeCfg<split_oct_domain_t>(params, assumptions, live, results);
-        break;
-      case BOXES:
-	analyzeCfg<boxes_domain_t>(params, assumptions, live, results);
-        break;
-      case OPT_OCT_APRON:
-	analyzeCfg<opt_oct_apron_domain_t>(params, assumptions, live, results);
-        break;
-      case PK_APRON:
-	analyzeCfg<pk_apron_domain_t>(params, assumptions, live, results);
-        break;
-      case TERMS_ZONES:
-	analyzeCfg<num_domain_t>(params, assumptions, live, results);
-        break;
-      default: 
-        if (params.dom != INTERVALS) {
-          crab::outs() << "Warning: abstract domain not found.\n"
-		       << "If FASTER_COMPILATION is enabled then "
-		       << "some domains are not available.\n"
-                       << "Running intervals ...\n"; 
-        }
-	analyzeCfg<interval_domain_t>(params, assumptions, live, results);
+      typedef path_analyzer<cfg_ref_t, AbsDom> path_analyzer_t;
+      AbsDom init;
+      path_analyzer_t path_analyzer(*m_cfg, init);
+      bool compute_preconditions = populate_maps;
+      res = path_analyzer.solve(path, layered_solving, compute_preconditions);
+      if (populate_maps) {
+	for(auto n: path) {
+	  if (const llvm::BasicBlock* bb = n.get_basic_block()) {
+	    AbsDom abs_val = path_analyzer.get_fwd_constraints(n);
+	    post.insert(std::make_pair(bb, mkGenericAbsDomWrapper(abs_val)));
+	    if (abs_val.is_bottom()) {
+	      // the rest of blocks must be also bottom so we don't
+	      // bother storing them.
+	      break;
+	    }
+	  }
+	}
+      }
+
+      if (!res) {
+	path_analyzer.get_unsat_core(core);
+
+	if (populate_maps) {
+	  for(auto n: path) {
+	    if (const llvm::BasicBlock* bb = n.get_basic_block()) {
+	      AbsDom abs_val = path_analyzer.get_bwd_constraints(n);
+	      pre.insert(std::make_pair(bb, mkGenericAbsDomWrapper(abs_val)));
+	      if (abs_val.is_bottom()) {
+		// the rest of blocks must be also bottom so we don't
+		// bother storing them.
+		break;
+	      }
+	    }
+	  }
+	}
       }
     }
+        
+    
+    struct intra_analysis {
+      std::function<void(const AnalysisParams&,
+			 const BasicBlock*,
+			 const assumption_map_t&,
+			 liveness_t*,
+			 InvarianceAnalysisResults&)> analyze;
+      std::string name;
+    };
+
+    struct path_analysis {
+      std::function<void(const std::vector<llvm_basic_block_wrapper>&,
+			 std::vector<crab::cfg::statement_wrapper>&,
+			 bool, bool, invariant_map_t&, invariant_map_t&,bool&)> analyze;
+      std::string name;
+    };
+    
+    // Domains used for intra-procedural analysis
+    const std::map<CrabDomain, intra_analysis> intra_analyses {
+      { INTERVALS               , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<interval_domain_t>), "classical intervals" } } 
+      #ifdef HAVE_ALL_DOMAINS	
+      , { INTERVALS_CONGRUENCES , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<ric_domain_t>), "reduced product of intervals and congruences" }}
+      , { DIS_INTERVALS         , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<dis_interval_domain_t>), "disjunctive intervals" }}
+      , { TERMS_INTERVALS       , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<term_int_domain_t>), "terms with intervals" }}
+      #endif 	
+      , { WRAPPED_INTERVALS     , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<wrapped_interval_domain_t>), "wrapped intervals" }}
+      , { ZONES_SPLIT_DBM       , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<split_dbm_domain_t>), "zones" }}
+      , { OCT_SPLIT_DBM         , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<split_oct_domain_t>), "soct" }}
+      , { BOXES                 , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<boxes_domain_t>), "boxes" }}
+      , { OCT                   , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<oct_domain_t>), "octagons" }}
+      , { PK                    , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<pk_domain_t>), "polyhedra" }}
+      , { TERMS_ZONES           , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<num_domain_t>), "terms with zones" }}
+      , { TERMS_DIS_INTERVALS   , { bind_this(this, &IntraCrabLlvm_Impl::analyzeCfg<term_dis_int_domain_t>), "terms with disjunctive intervals" }}
+    };
+
+
+    // Domains used for path-based analysis
+    const std::map<CrabDomain, path_analysis> path_analyses {
+      { INTERVALS               , { bind_this(this, &IntraCrabLlvm_Impl::wrapperPathAnalyze<interval_domain_t>), "classical intervals" } } 
+      #ifdef HAVE_ALL_DOMAINS	
+      , { TERMS_INTERVALS       , { bind_this(this, &IntraCrabLlvm_Impl::wrapperPathAnalyze<term_int_domain_t>), "terms with intervals" }}
+      #endif 	
+      , { WRAPPED_INTERVALS     , { bind_this(this, &IntraCrabLlvm_Impl::wrapperPathAnalyze<wrapped_interval_domain_t>), "wrapped intervals" }}
+      , { ZONES_SPLIT_DBM       , { bind_this(this, &IntraCrabLlvm_Impl::wrapperPathAnalyze<split_dbm_domain_t>), "zones" }}
+      , { BOXES                  , { bind_this(this, &IntraCrabLlvm_Impl::wrapperPathAnalyze<boxes_domain_t>), "boxes" }}      
+      , { TERMS_ZONES           , { bind_this(this, &IntraCrabLlvm_Impl::wrapperPathAnalyze<num_domain_t>), "terms with zones" }}
+      /* 
+	 To add new domains here make sure you add an explicit
+	 instantiation in crab/path_analyzer.cc 
+      */
+      //, { TERMS_DIS_INTERVALS , { bind_this(this, &IntraCrabLlvm_Impl::wrapperPathAnalyze<term_dis_int_domain_t>), "terms with disjunctive intervals" }}
+    };
 
   public:
     
     IntraCrabLlvm_Impl(Function &fun,
 		       crab::cfg::tracked_precision cfg_precision,
 		       heap_abs_ptr mem, llvm_variable_factory &vfac,
-		       const TargetLibraryInfo &tli)
+		       CfgManager &cfg_man, const TargetLibraryInfo &tli)
+		       
       : m_cfg(nullptr), m_fun(fun), m_vfac(vfac) {
       if (isTrackable(m_fun)) {
 	// -- build a crab cfg for func
 	CfgBuilder builder(m_fun, m_vfac, *mem, cfg_precision, true, &tli);
-	  CRAB_VERBOSE_IF(1, llvm::outs () << "Built Crab CFG for "
-			                   << fun.getName() << "\n");
-			  
-	  m_cfg = builder.getCfg();
+	m_cfg = builder.get_cfg();
+	m_edge_bb_map = builder.getEdgeToBBMap();
+	CRAB_VERBOSE_IF(1, llvm::outs() << "Built Crab CFG for "
+			                << fun.getName() << "\n");
+	cfg_man.add(fun, m_cfg);
+	  
       } else {
-	CRAB_VERBOSE_IF(1, llvm::outs () << "Cannot build CFG for "
-			                 << fun.getName() << "\n");
+	CRAB_VERBOSE_IF(1, llvm::outs() << "Cannot build CFG for "
+			                << fun.getName() << "\n");
       }
     }
 
-    cfg_ptr_t Cfg () { return m_cfg; }
-
-    void Analyze(AnalysisParams &params, const assumption_map_t &assumptions,
+    void Analyze(AnalysisParams &params,
+		 const llvm::BasicBlock *entry,
+		 const assumption_map_t &assumptions,
 		 InvarianceAnalysisResults &results) {
 
       if (!m_cfg) {
-	CRAB_VERBOSE_IF(1, llvm::outs () << "Skipped analysis for "
-			                 << m_fun.getName() << "\n");
+	CRAB_VERBOSE_IF(1, llvm::outs() << "Skipped analysis for "
+			                << m_fun.getName() << "\n");
 	return;
       }
       
@@ -754,61 +909,142 @@ namespace crab_llvm {
 	CRAB_VERBOSE_IF(1,
 			auto fdecl = m_cfg->get_func_decl ();            
 			assert (fdecl);
-			crab::outs() << "Running liveness analysis for " 
-			             << (*fdecl).get_func_name ()
-		                     << "  ...\n";);
+			get_crab_os() << "Running liveness analysis for " 
+			              << (*fdecl).get_func_name ()
+		                      << "  ...\n";);
 	live.exec ();
-	CRAB_VERBOSE_IF(1, crab::outs() << "Finished liveness analysis.\n");
+	CRAB_VERBOSE_IF(1, get_crab_os() << "Finished liveness analysis.\n");
 	// some stats
 	unsigned total_live, avg_live_per_blk, max_live_per_blk;
 	live.get_stats (total_live, max_live_per_blk, avg_live_per_blk);
 	CRAB_VERBOSE_IF(1, 
-		 crab::outs() << "-- Max number of out live vars per block=" 
-                              << max_live_per_blk << "\n"
-                              << "-- Avg number of out live vars per block=" 
-                              << avg_live_per_blk << "\n";);
+		  crab::outs() << "-- Max number of out live vars per block=" 
+                               << max_live_per_blk << "\n"
+                               << "-- Avg number of out live vars per block=" 
+                               << avg_live_per_blk << "\n";);
 	crab::CrabStats::count_max ("Liveness.count.maxOutVars",
 				    max_live_per_blk);
 
 	if (isRelationalDomain(params.dom)) {
 	  CRAB_VERBOSE_IF(1, 
-		   crab::outs() << "Max live per block: "
-		                << max_live_per_blk << "\n"
-		                << "Threshold: "
-		                << params.relational_threshold << "\n");
+		    crab::outs() << "Max live per block: "
+		                 << max_live_per_blk << "\n"
+		                 << "Threshold: "
+		                 << params.relational_threshold << "\n");
 	  if (max_live_per_blk > params.relational_threshold) {
-          #ifdef FASTER_COMPILATION
-	  params.dom = INTERVALS;
-	  #else
-	  params.dom = DIS_INTERVALS;
-          #endif 
+	    // default domain
+	    params.dom = INTERVALS;
 	  }
 	}
       }
-      wrapperAnalyze(params, assumptions, (params.run_liveness)? &live : nullptr, results);
+
+      if (intra_analyses.count(params.dom)) {
+      	intra_analyses.at(params.dom).analyze(params, entry, assumptions,
+					     (params.run_liveness)? &live : nullptr,
+					     results);
+      } else {
+      	crab::outs() << "Warning: abstract domain not found or enabled.\n"
+      		     << "Running " << intra_analyses.at(INTERVALS).name << " ...\n"; 
+      	intra_analyses.at(INTERVALS).analyze(params, entry, assumptions,
+					    (params.run_liveness)? &live : nullptr,
+					    results);
+      }
     }
+    
+    bool pathAnalyze(const AnalysisParams& params,
+		     const std::vector<const llvm::BasicBlock*>& blocks,
+		     bool layered_solving, 
+		     std::vector<crab::cfg::statement_wrapper>& core,
+		     bool populate_maps, 
+		     invariant_map_t& post, invariant_map_t& pre) const {
+      assert(m_cfg);
+
+      // build the full path (included internal basic blocks added
+      // during the translation to Crab)
+      std::vector<llvm_basic_block_wrapper> path;
+      path.reserve(blocks.size());
+      for(unsigned i=0; i < blocks.size(); ++i) {
+	path.push_back(blocks[i]);
+	if (i < blocks.size() - 1) {
+	  auto it = m_edge_bb_map.find(std::make_pair(blocks[i], blocks[i+1]));
+	  if (it != m_edge_bb_map.end()) {
+	    path.push_back(it->second);
+	  }
+	}
+      }
+
+      bool res;
+      if (path_analyses.count(params.dom)) {
+      	path_analyses.at(params.dom).analyze(path, core, layered_solving , populate_maps,
+					     post, pre, res);
+      } else {
+      	crab::outs() << "Warning: abstract domain not found or enabled.\n"
+      		     << "Running " << path_analyses.at(INTERVALS).name << " ...\n";
+      	path_analyses.at(INTERVALS).analyze(path, core, layered_solving, populate_maps,
+					    post, pre, res);
+	
+      }
+      return res;
+    }
+    
   }; // end class
 
   /**
    *   Begin IntraCrabLlvm methods
    **/
   IntraCrabLlvm::IntraCrabLlvm(Function &fun, const TargetLibraryInfo &tli,
+			       CfgManager &cfg_man,
 			       crab::cfg::tracked_precision cfg_precision,
-			       heap_abs_ptr heap_abs) : m_impl(nullptr) {
+			       heap_abs_ptr heap_abs)
+    : m_impl(nullptr), m_fun(&fun) {
     if (!heap_abs)
       heap_abs = boost::make_shared<DummyHeapAbstraction>();
     
     m_impl = make_unique<IntraCrabLlvm_Impl>(fun, cfg_precision,
-					     heap_abs, m_vfac, tli);
+					     heap_abs, m_vfac, cfg_man, tli);
   }
 
   IntraCrabLlvm::~IntraCrabLlvm() {}
-    
+
+  void IntraCrabLlvm::clear() {
+    m_pre_map.clear();
+    m_post_map.clear();
+    m_checks_db.clear();
+  }
+  
   void IntraCrabLlvm::analyze(AnalysisParams &params,
 			      const assumption_map_t &assumptions) {
-    checks_db_ptr checksdb = nullptr;
-    InvarianceAnalysisResults results = { m_pre_map, m_post_map, checksdb};
-    m_impl->Analyze(params, assumptions, results);
+    InvarianceAnalysisResults results = { m_pre_map, m_post_map, m_checks_db};
+    
+    m_impl->Analyze(params, &(m_fun->getEntryBlock()), assumptions, results);
+  }
+
+  void IntraCrabLlvm::analyze(AnalysisParams &params,
+			      const llvm::BasicBlock *entry,
+			      const assumption_map_t &assumptions) {
+    InvarianceAnalysisResults results = { m_pre_map, m_post_map, m_checks_db};
+    m_impl->Analyze(params, entry, assumptions, results);
+  }
+  
+  template<>
+  bool IntraCrabLlvm::path_analyze(const AnalysisParams& params,
+				   const std::vector<const llvm::BasicBlock*>& path,
+				   bool layered_solving, 
+				   std::vector<crab::cfg::statement_wrapper>& core) const {
+    invariant_map_t pre_conditions, post_conditions;
+    return m_impl->pathAnalyze(params, path, layered_solving, core, false,
+			       post_conditions, pre_conditions);
+  }
+
+  template<>
+  bool IntraCrabLlvm::path_analyze(const AnalysisParams& params,
+				   const std::vector<const llvm::BasicBlock*>& path,
+				   bool layered_solving, 
+				   std::vector<crab::cfg::statement_wrapper>& core,
+				   invariant_map_t& post_conditions,
+				   invariant_map_t& pre_conditions) const {
+    return m_impl->pathAnalyze(params, path, layered_solving, core, true,
+			       post_conditions, pre_conditions);
   }
 
   wrapper_dom_ptr IntraCrabLlvm::get_pre(const llvm::BasicBlock *block,
@@ -828,193 +1064,225 @@ namespace crab_llvm {
 				       m_vfac.get_shadow_vars().end());    
     return lookup(m_post_map, *block, shadows);
   }
+
+  const checks_db_t& IntraCrabLlvm::get_checks_db() const { return m_checks_db;}
+  
   /**
    *   End IntraCrabLlvm methods
    **/
-    
-  /** Run inter-procedural analysis on the whole call graph **/
-  template<typename BUDom, typename TDDom>
-  static void analyze_cg (call_graph_ref_t cg, const Module &M,
-			  const liveness_map_t& live,
-			  invariant_map_t &premap, invariant_map_t &postmap,
-			  const llvm_variable_factory &vfac,
-			  checks_db_ptr &checkdb) {
-    
-    typedef inter_fwd_analyzer<call_graph_ref_t, BUDom, TDDom> inter_analyzer_t;
-    typedef inter_checker<inter_analyzer_t> inter_checker_t;
-    typedef assert_property_checker<inter_analyzer_t> assert_prop_t;
-    typedef null_property_checker<inter_analyzer_t> null_prop_t;
-    
-    CRAB_VERBOSE_IF(1, 
-	     crab::outs() << "Running inter-procedural analysis with " 
-	                  << "forward domain:" 
-	                  << "\"" << TDDom::getDomainName () << "\""
-	                  << " and bottom-up domain:" 
-                          << "\"" << BUDom::getDomainName () << "\"" 
-                          << "  ...\n";);
-    
-    inter_analyzer_t analyzer(cg, (CrabLive ? &live : nullptr),
-			      CrabWideningDelay, 
-			      CrabNarrowingIters, 
-			      CrabWideningJumpSet);
-    analyzer.Run (TDDom::top ());
-    
-    CRAB_VERBOSE_IF(1, crab::outs() << "Finished inter-procedural analysis.\n");
-    
-    // -- store invariants     
-    for (auto &n: boost::make_iterator_range (vertices (cg))) {
-      cfg_ref_t cfg = n.get_cfg ();
-      if (const Function *F = M.getFunction(n.name())) {
-	for (auto &B : *F) {
-	  // --- invariants that hold at the entry of the blocks
-	  auto pre = analyzer.get_pre (cfg, &B);
-	  premap.insert(std::make_pair(&B, mkGenericAbsDomWrapper(pre)));
-	  // --- invariants that hold at the exit of the blocks
-	  auto post = analyzer.get_post (cfg, &B);
-	  postmap.insert(std::make_pair(&B,mkGenericAbsDomWrapper(post)));
-	  
-	  if (CrabStats) {
-	    unsigned num_block_invars = 0;
-	    // TODO CRAB: for boxes we would like to use
-	    // to_disjunctive_linear_constraint_system() but it needs to
-	    // be exposed to all domains
-	    num_block_invars += pre.to_linear_constraint_system().size();
-	    num_invars += num_block_invars;
-	    if (num_block_invars > 0) num_nontrivial_blocks++;
-	  }
-	}
-	
-	// --- print invariants and summaries
-	if (CrabPrintAns && isTrackable(*F)) {
-	  llvm::outs() << "\n" << "function " << F->getName () << "\n";
-	  std::vector<std::unique_ptr<pretty_printer_impl::block_annotation>> annotations;
-	  annotations.emplace_back(make_unique<pretty_printer_impl::invariant_annotation>
-				   (vfac, premap, postmap, CrabKeepShadows));
-	  pretty_printer_impl::print_annotations(cfg, annotations);	    
-	}
-	
-	// Summaries are not currently stored but it would be easy to do so.	    
-	if (CrabPrintSumm && analyzer.has_summary (cfg)) {
-	  auto summ = analyzer.get_summary (cfg);
-	  crab::outs() << "SUMMARY " << *summ << "\n";
-	}
-      }
-    }
-    
-    // --- checking assertions and collecting data
-    if (CrabCheck) {
-      CRAB_VERBOSE_IF(1, crab::outs() << "Checking assertions ... \n"); 
-      typename inter_checker_t::prop_checker_ptr
-	prop(new assert_prop_t(CrabCheckVerbose));
-      if (CrabCheck == NULLITY)
-	prop.reset (new null_prop_t(CrabCheckVerbose));      
-      inter_checker_t checker (analyzer, {prop});
-      checker.run ();
-      //CRAB_VERBOSE_IF(1, checker.show (crab::outs()));
-      checkdb = boost::make_shared<checks_db_t>();
-      (*checkdb) += checker.get_all_checks();
-      CRAB_VERBOSE_IF(1, crab::outs() << "Finished assert checking.\n"); 
-    }
-    return;
-  }
-  
-  #ifdef FASTER_COMPILATION
-  #define INTER_ANALYZE(DOM,CG,M,LIVE,PRE,POST,VFAC,CHECKS)		       \
-   switch (CrabSummDomain){                                                    \
-     default:                                                                  \
-       if (CrabSummDomain != ZONES_SPLIT_DBM)                                  \
-         crab::outs() << "Warning: choosing zones to compute summaries\n";     \
-       analyze_cg<split_dbm_domain_t,DOM> (CG, M, LIVE, PRE, POST, VFAC, CHECKS);}
-  #else
-  #define INTER_ANALYZE(DOM,CG,M,LIVE,PRE,POST,VFAC,CHECKS)		       \
-  switch (CrabSummDomain){                                                     \
-    case OCTAGON_SPLIT:                                                        \
-      analyze_cg<split_oct_domain_t,DOM>(CG, M, LIVE, PRE, POST, VFAC, CHECKS); \
-      break;                                                                   \
-    case OPT_OCT_APRON:                                                        \
-      analyze_cg<opt_oct_apron_domain_t,DOM>(CG, M, LIVE, PRE, POST, VFAC, CHECKS); \
-      break;                                                                   \
-    case TERMS_ZONES:                                                          \
-      analyze_cg<num_domain_t,DOM>(CG, M, LIVE, PRE, POST, VFAC, CHECKS);      \
-      break;						                       \
-    default:                                                                   \
-      analyze_cg<split_dbm_domain_t,DOM>(CG, M, LIVE, PRE, POST, VFAC, CHECKS);}
-  #endif 
 
   /**
-   * Begin CrabLlvmPass methods
+   *   Internal implementation of the inter-procedural analysis
    **/
-  CrabLlvmPass::CrabLlvmPass ()
-    : llvm::ModulePass (ID), 
-      m_mem (boost::make_shared<DummyHeapAbstraction>()),
-      m_checks_db (nullptr) { }
+  class InterCrabLlvm_Impl {
+    std::unique_ptr<call_graph_t> m_cg;
+    Module& m_M;
+    llvm_variable_factory &m_vfac;
+    liveness_map_t m_live_map;
+      
+    /** Run inter-procedural analysis on the whole call graph **/
+    template<typename BUDom, typename TDDom>
+    void analyzeCg(const AnalysisParams &params,
+		   InvarianceAnalysisResults &results) {
+      
+      typedef inter_fwd_analyzer<call_graph_ref_t, BUDom, TDDom> inter_analyzer_t;
+      typedef inter_checker<inter_analyzer_t> inter_checker_t;
+      typedef assert_property_checker<inter_analyzer_t> assert_prop_t;
+      typedef null_property_checker<inter_analyzer_t> null_prop_t;
+      
+      CRAB_VERBOSE_IF(1, 
+ 		      get_crab_os() << "Running inter-procedural analysis with " 
+		                    << "forward domain:" 
+		                    << "\"" << TDDom::getDomainName () << "\""
+		                    << " and bottom-up domain:" 
+		                    << "\"" << BUDom::getDomainName () << "\"" 
+		                    << "  ...\n";);
+      
+      inter_analyzer_t analyzer(*m_cg, (params.run_liveness ? &m_live_map : nullptr),
+				params.widening_delay, 
+				params.narrowing_iters, 
+				params.widening_jumpset);
+      analyzer.Run (TDDom::top ());
+    
+      CRAB_VERBOSE_IF(1, get_crab_os() << "Finished inter-procedural analysis.\n");
+      
+      // -- store invariants
+      if (params.store_invariants || params.print_invars) {
+	CRAB_VERBOSE_IF(1, get_crab_os() << "Storing invariants.\n");
+      }
+      
+      for (auto &n: boost::make_iterator_range(vertices(*m_cg))) {
+	cfg_ref_t cfg = n.get_cfg ();
+	if (const Function *F = m_M.getFunction(n.name())) {
+	  
 
-  void CrabLlvmPass::releaseMemory () {
-    m_pre_map.clear(); 
-    m_post_map.clear(); 
-    m_cfg_map.clear ();
-  }
-  
-  bool CrabLlvmPass::runOnModule (Module &M) {
-    #ifdef HAVE_DSA
-    m_mem.reset
-      (new LlvmDsaHeapAbstraction(M,&getAnalysis<SteensgaardDataStructures>(),
-				  CrabDsaDisambiguateUnknown,
-				  CrabDsaDisambiguatePtrCast,
-				  CrabDsaDisambiguateExternal));
-    #endif     
+	  if (params.store_invariants || params.print_invars) {
+	    for (auto &B : *F) {
+	      // --- invariants that hold at the entry of the blocks
+	      auto pre = analyzer.get_pre (cfg, &B);
+	      update(results.premap, B, mkGenericAbsDomWrapper(pre));
+	      // --- invariants that hold at the exit of the blocks
+	      auto post = analyzer.get_post (cfg, &B);
+	      update(results.postmap, B, mkGenericAbsDomWrapper(post));
+	      
+	      if (params.stats) {
+		unsigned num_block_invars = 0;
+		// TODO CRAB: for boxes we would like to use
+		// to_disjunctive_linear_constraint_system() but it needs to
+		// be exposed to all domains
+		num_block_invars += pre.to_linear_constraint_system().size();
+		num_invars += num_block_invars;
+	      if (num_block_invars > 0) num_nontrivial_blocks++;
+	      }
+	    }
+	    
+	    // --- print invariants and summaries
+	    if (params.print_invars && isTrackable(*F)) {
+	      if (auto f_decl = cfg.get_func_decl()) {
+		crab::outs() << "\n" << *f_decl << "\n";
+	      } else {
+		llvm::outs() << "\n" << "function " << F->getName () << "\n";
+	      }
+	      std::vector<std::unique_ptr<pretty_printer_impl::block_annotation>> annotations;
+	      annotations.emplace_back(make_unique<pretty_printer_impl::invariant_annotation>
+				       (m_vfac, results.premap, results.postmap,
+					params.keep_shadow_vars));
+	      pretty_printer_impl::print_annotations(cfg, annotations);	    
+	    }
+	  }
+	  
+	  // Summaries are not currently stored but it would be easy to do so.	    
+	  if (params.print_summaries && analyzer.has_summary (cfg)) {
+	    auto summ = analyzer.get_summary (cfg);
+	    crab::outs() << "SUMMARY " << *summ << "\n";
+	  }
+	}
+      }
+      
+      if (params.store_invariants || params.print_invars) {	
+	CRAB_VERBOSE_IF(1, get_crab_os() << "All invariants stored.\n");
+      }
+      
+      // --- checking assertions and collecting data
+      if (params.check) {
+	CRAB_VERBOSE_IF(1, get_crab_os() << "Checking assertions ... \n"); 
+	typename inter_checker_t::prop_checker_ptr
+	  prop(new assert_prop_t(params.check_verbose));
+	if (params.check == NULLITY)
+	  prop.reset (new null_prop_t(params.check_verbose));      
+	inter_checker_t checker (analyzer, {prop});
+	checker.run ();
+	//CRAB_VERBOSE_IF(1, checker.show (crab::outs()));
+	results.checksdb += checker.get_all_checks();
+	CRAB_VERBOSE_IF(1, get_crab_os() << "Finished assert checking.\n"); 
+      }
+      return;
+    }
+    // Domains used for inter-procedural analysis
+    struct inter_analysis {
+      std::function<void(const AnalysisParams&, InvarianceAnalysisResults&)> analyze;
+      std::string name;
+    };
 
-    CRAB_VERBOSE_IF(1,
-             unsigned num_analyzed_funcs = 0;
-             for (auto &F : M) {
-	       if (!isTrackable(F)) continue;
-               num_analyzed_funcs++;
-             }
-             crab::outs() << "Total number of analyzed functions:" 
-                          << num_analyzed_funcs << "\n";);
+    // Domains used for intra-procedural analysis
+    const std::map<std::pair<CrabDomain,CrabDomain>, inter_analysis> inter_analyses {
+        {{ZONES_SPLIT_DBM, INTERVALS},
+	 { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<split_dbm_domain_t, interval_domain_t>), "bottom-up:zones, top-down:intervals" }}
+      , {{ZONES_SPLIT_DBM, WRAPPED_INTERVALS},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<split_dbm_domain_t, wrapped_interval_domain_t>), "bottom-up:zones, top-down:wrapped intervals" }}
+      , {{ZONES_SPLIT_DBM, ZONES_SPLIT_DBM},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<split_dbm_domain_t, split_dbm_domain_t>), "bottom-up:zones, top-down:zones" }}
+      , {{ZONES_SPLIT_DBM, BOXES},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<split_dbm_domain_t, boxes_domain_t>), "bottom-up:zones, top-down:boxes" }}
+      , {{ZONES_SPLIT_DBM, OCT},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<split_dbm_domain_t, oct_domain_t>), "bottom-up:zones, top-down:oct" }}
+      , {{ZONES_SPLIT_DBM, PK},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<split_dbm_domain_t, pk_domain_t>), "bottom-up:zones, top-down:pk" }}
+      , {{ZONES_SPLIT_DBM, TERMS_ZONES},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<split_dbm_domain_t, num_domain_t>), "bottom-up:zones, top-down:terms+zones" }}
+      , {{ZONES_SPLIT_DBM, TERMS_DIS_INTERVALS},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<split_dbm_domain_t, term_dis_int_domain_t>), "bottom-up:zones, top-down:terms+dis_intervals" }}
+      //////////////////////////////////////////////////////
+      , {{OCT, INTERVALS},
+	 { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<oct_domain_t, interval_domain_t>), "bottom-up:oct, top-down:intervals" }}
+      , {{OCT, WRAPPED_INTERVALS},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<oct_domain_t, wrapped_interval_domain_t>), "bottom-up:oct, top-down:wrapped intervals" }}
+      , {{OCT, ZONES_SPLIT_DBM},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<oct_domain_t, split_dbm_domain_t>), "bottom-up:oct, top-down:zones" }}
+      , {{OCT, BOXES},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<oct_domain_t, boxes_domain_t>), "bottom-up:oct, top-down:boxes" }}
+      , {{OCT, OCT},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<oct_domain_t, oct_domain_t>), "bottom-up:oct, top-down:oct" }}
+      , {{OCT, PK},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<oct_domain_t, pk_domain_t>), "bottom-up:oct, top-down:pk" }}
+      , {{OCT, TERMS_ZONES},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<oct_domain_t, num_domain_t>), "bottom-up:oct, top-down:terms+zones" }}
+      , {{OCT, TERMS_DIS_INTERVALS},
+	  { bind_this(this, &InterCrabLlvm_Impl::analyzeCg<oct_domain_t, term_dis_int_domain_t>), "bottom-up:oct, top-down:terms+dis_intervals" }}
+    };
+    
+  public:
+    
+    InterCrabLlvm_Impl(Module& M,
+		       crab::cfg::tracked_precision cfg_precision,
+		       heap_abs_ptr mem, llvm_variable_factory &vfac,
+		       CfgManager &cfg_man, const TargetLibraryInfo &tli)
+      : m_cg(nullptr), m_M(M), m_vfac(vfac) {
 
-    if (CrabInter){
+      std::vector<cfg_ref_t> cfg_ref_vector;
+      for (auto &F : m_M) {
+        if (isTrackable(F)) {
+	  // -- build cfg's 
+	  CfgBuilder B(F, m_vfac, *mem, cfg_precision,
+		       /*include function decls and callsites*/
+		       true,  &tli);
+	  cfg_t *cfg = B.get_cfg();
+	  cfg_man.add(F, cfg);
+	  cfg_ref_vector.push_back (*cfg);
+	  CRAB_VERBOSE_IF(1, llvm::outs() << "Built Crab CFG for "
+			  << F.getName() << "\n");
+	} else {
+	  CRAB_VERBOSE_IF(1, llvm::outs() << "Cannot build CFG for "
+			                  << F.getName() << "\n");
+	}
+      }
+      // build call graph
+      m_cg = make_unique<call_graph_t>(cfg_ref_vector.begin(), cfg_ref_vector.end());
+    }
+    
+    void Analyze(AnalysisParams &params,
+		 const assumption_map_t &/*assumptions*/ /*unused*/,
+		 InvarianceAnalysisResults &results) {
 
-      CrabDomain absdom =  CrabLlvmDomain;
-      std::vector<cfg_ref_t> cfgs;
-      liveness_map_t live_map;
-      unsigned max_live_per_blk = 0;
-      for (auto &F : M) {
-        // -- skip functions without a body or variadic functions
-        if (!isTrackable(F)) continue;
-
-        // -- build cfg
-        CfgBuilder B (F, m_vfac, *m_mem, CrabTrackLev,
-                      /*include function decls and callsites*/
-                      true,  &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI());
-
-        auto cfg_ptr = B.getCfg();
-        m_cfg_map [&F] = cfg_ptr;
-        cfgs.push_back (*cfg_ptr);
-
-        // -- build liveness
-        if (CrabLive || isRelationalDomain(absdom)) {
+      // If the number of live variables per block is too high we
+      // switch to a cheap domain regardless what the user wants.
+      CrabDomain absdom =  params.dom;
+      
+      /* Compute liveness information and choose statically the
+	 abstract domain */
+      if (params.run_liveness || isRelationalDomain(absdom)) {
+	unsigned max_live_per_blk = 0;
+	for (auto cg_node: boost::make_iterator_range(vertices(*m_cg))) {
+	  auto cfg_ref = cg_node.get_cfg();
           CRAB_VERBOSE_IF(1,
-                   auto fdecl = cfg_ptr->get_func_decl ();            
-                   assert (fdecl);
-                   crab::outs() << "Running liveness analysis for " 
-                                << (*fdecl).get_func_name () << "  ...\n";);
-
-	  liveness_t* live = new liveness_t (*cfg_ptr);
+			  auto fdecl = cfg_ref.get_func_decl ();            
+			  assert (fdecl);
+			  get_crab_os() << "Running liveness analysis for " 
+			                << (*fdecl).get_func_name () << "  ...\n";);
+	  liveness_t* live = new liveness_t (cfg_ref);
           live->exec ();
-          CRAB_VERBOSE_IF(1, crab::outs() << "Finished liveness analysis.\n";);
+          CRAB_VERBOSE_IF(1, get_crab_os() << "Finished liveness analysis.\n";);
           // some stats
           unsigned total_live, max_live_per_blk_, avg_live_per_blk;
           live->get_stats (total_live, max_live_per_blk_, avg_live_per_blk);
           max_live_per_blk = std::max (max_live_per_blk, max_live_per_blk_);
           CRAB_VERBOSE_IF(1,
-                   crab::outs() << "-- Max number of out live vars per block=" 
-                                << max_live_per_blk_ << "\n";
-                   crab::outs() << "-- Avg number of out live vars per block=" 
-                                << avg_live_per_blk << "\n";);
+		    crab::outs() << "-- Max number of out live vars per block=" 
+                                 << max_live_per_blk_ << "\n";
+		    crab::outs() << "-- Avg number of out live vars per block=" 
+                                 << avg_live_per_blk << "\n";);
           crab::CrabStats::count_max ("Liveness.count.maxOutVars",
 				      max_live_per_blk);
-
 
 	  if (isRelationalDomain(absdom)) {
 	    // FIXME: the selection of the final domain is fixed for the
@@ -1023,92 +1291,214 @@ namespace crab_llvm {
 	    //        used for all functions. We should be able to change
 	    //        from one function to another.
 	    CRAB_VERBOSE_IF(1,
-		     crab::outs() << "Max live per block: "
-		                  << max_live_per_blk << "\n"
-		                  << "Threshold: "
-		                  << CrabRelationalThreshold << "\n");
-	    if (max_live_per_blk > CrabRelationalThreshold) {
-              #ifdef FASTER_COMPILATION
+		      crab::outs() << "Max live per block: "
+		                   << max_live_per_blk << "\n"
+		                   << "Threshold: "
+		                   << params.relational_threshold << "\n");
+	    if (max_live_per_blk > params.relational_threshold) {
+	      // default domain
 	      absdom = INTERVALS;
-	      #else
-	      absdom = DIS_INTERVALS;
-	      #endif 
 	    }
 	  }
 	  
-	  if (CrabLive) {
-	    live_map.insert(std::make_pair(cfg_ref_t(*cfg_ptr), live));
+	  if (params.run_liveness) {
+	    m_live_map.insert(std::make_pair(cfg_ref, live));	    
 	  } else {
 	    delete live;
 	  }
-        }
+	} // end for
       }
-
-      // -- build call graph
-      boost::scoped_ptr<call_graph_t> cg(new call_graph_t(cfgs));
-      // -- run the interprocedural analysis            
-      switch (absdom) {
-        #ifndef FASTER_COMPILATION
-        case INTERVALS_CONGRUENCES: 
-          INTER_ANALYZE(ric_domain_t, *cg, M, live_map,
-			m_pre_map, m_post_map, m_vfac, m_checks_db); 
-          break;
-        case TERMS_INTERVALS:
-          INTER_ANALYZE(term_int_domain_t, *cg, M, live_map,
-			m_pre_map, m_post_map, m_vfac, m_checks_db); 
-          break;
-        case DIS_INTERVALS:
-          INTER_ANALYZE(dis_interval_domain_t, *cg, M, live_map,
-			m_pre_map, m_post_map, m_vfac, m_checks_db); 
-          break;
-        #endif 
-        case TERMS_DIS_INTERVALS:
-          INTER_ANALYZE(term_dis_int_domain_t, *cg, M, live_map,
-			m_pre_map, m_post_map, m_vfac, m_checks_db); 
-          break;
-        case ZONES_SPLIT_DBM: 
-          INTER_ANALYZE(split_dbm_domain_t, *cg, M, live_map,
-			m_pre_map, m_post_map, m_vfac, m_checks_db); 
-          break;
-        case OCTAGON_SPLIT: 
-          INTER_ANALYZE(split_dbm_domain_t, *cg, M, live_map,
-			m_pre_map, m_post_map, m_vfac, m_checks_db); 
-          break;
-        case OPT_OCT_APRON:
-          INTER_ANALYZE(opt_oct_apron_domain_t, *cg, M, live_map,
-			m_pre_map, m_post_map, m_vfac, m_checks_db); 
-          break;
-        case PK_APRON:
-          INTER_ANALYZE(pk_apron_domain_t, *cg, M, live_map,
-			m_pre_map, m_post_map, m_vfac, m_checks_db); 
-          break;
-        case TERMS_ZONES: 
-          INTER_ANALYZE(num_domain_t, *cg, M, live_map,
-			m_pre_map, m_post_map, m_vfac, m_checks_db); 
-          break;
-        default: 
-          if (absdom != INTERVALS)
-            crab::outs() << "Warning: either abstract domain not found or "
-                         << "inter-procedural version not implemented.\n"
-                         << "If FASTER_COMPILATION is enabled then "
-	                 << "some domains are not available.\n"
-                         << "Running intervals ...\n"; 
-          INTER_ANALYZE (interval_domain_t, *cg, M, live_map,
-			 m_pre_map, m_post_map, m_vfac, m_checks_db);
+      
+      // -- run the interprocedural analysis
+      if (inter_analyses.count({params.sum_dom, params.dom})) {
+      	inter_analyses.at({params.sum_dom, params.dom}).analyze(params, results);
+      } else {
+      	crab::outs() << "Warning: abstract domains not found or enabled.\n"
+      		     << "Running " << inter_analyses.at({ZONES_SPLIT_DBM, INTERVALS}).name << "\n";
+      	inter_analyses.at({ZONES_SPLIT_DBM, INTERVALS}).analyze(params, results);	
       }
       
       // free liveness map
-      if (CrabLive)
-        for (auto &p : live_map)
+      if (params.run_liveness) {
+        for (auto &p : m_live_map) {
           delete p.second;
+	}
+      }
     }
-    else {
-      // -- run intra-procedural analysis
+  };
+
+
+  /**
+   *   Begin InterCrabLlvm methods
+   **/
+  InterCrabLlvm::InterCrabLlvm(Module &module, const TargetLibraryInfo &tli,
+			       CfgManager &cfg_man,
+			       crab::cfg::tracked_precision cfg_precision,
+			       heap_abs_ptr heap_abs)
+    : m_impl(nullptr) {
+    if (!heap_abs)
+      heap_abs = boost::make_shared<DummyHeapAbstraction>();
+
+    m_impl = make_unique<InterCrabLlvm_Impl>(module, cfg_precision,
+					     heap_abs, m_vfac, cfg_man, tli);
+  }
+
+  InterCrabLlvm::~InterCrabLlvm() {}
+
+  void InterCrabLlvm::clear() {
+    m_pre_map.clear();
+    m_post_map.clear();
+    m_checks_db.clear();
+  }
+  
+  void InterCrabLlvm::analyze(AnalysisParams &params,
+			      const assumption_map_t &assumptions) {
+    InvarianceAnalysisResults results = { m_pre_map, m_post_map, m_checks_db};
+    m_impl->Analyze(params, assumptions, results);
+  }
+
+  wrapper_dom_ptr InterCrabLlvm::get_pre(const llvm::BasicBlock *block,
+					 bool keep_shadows) const {
+    std::vector<varname_t> shadows;
+    if (!keep_shadows)
+      shadows = std::vector<varname_t>(m_vfac.get_shadow_vars().begin(),
+				       m_vfac.get_shadow_vars().end());    
+    return lookup(m_pre_map, *block, shadows);
+  }   
+
+  wrapper_dom_ptr InterCrabLlvm::get_post(const llvm::BasicBlock *block,
+					  bool keep_shadows) const {
+    std::vector<varname_t> shadows;
+    if (!keep_shadows)
+      shadows = std::vector<varname_t>(m_vfac.get_shadow_vars().begin(),
+				       m_vfac.get_shadow_vars().end());    
+    return lookup(m_post_map, *block, shadows);
+  }
+
+  const checks_db_t& InterCrabLlvm::get_checks_db() const { return m_checks_db;}
+  
+  /**
+   * End InterCrabLlvm methods
+   **/
+  
+  /**
+   * Begin CrabLlvmPass methods
+   **/
+  CrabLlvmPass::CrabLlvmPass ()
+    : llvm::ModulePass (ID), 
+      m_mem(boost::make_shared<DummyHeapAbstraction>()),
+      m_tli(nullptr) { }
+
+  void CrabLlvmPass::releaseMemory () {
+    m_pre_map.clear(); 
+    m_post_map.clear();
+    m_checks_db.clear();
+  }
+
+  bool CrabLlvmPass::runOnFunction (Function &F) {
+    if (!CrabInter && isTrackable(F)) {
+      IntraCrabLlvm_Impl crab(F, CrabTrackLev, m_mem, m_vfac, m_cfg_man, *m_tli);
+      InvarianceAnalysisResults results = { m_pre_map, m_post_map, m_checks_db};
+      crab.Analyze(m_params, &F.getEntryBlock(), assumption_map_t(), results);
+    }
+    return false;
+  }
+  
+  bool CrabLlvmPass::runOnModule (Module &M) {
+
+    CRAB_VERBOSE_IF(1,
+	     get_crab_os() << "Started crab-llvm\n"; 
+             unsigned num_analyzed_funcs = 0;
+             for (auto &F : M) {
+	       if (!isTrackable(F)) continue;
+               num_analyzed_funcs++;
+             }
+             get_crab_os() << "Total number of analyzed functions:" 
+                           << num_analyzed_funcs << "\n";);
+
+    m_tli = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
+    const DataLayout& dl = M.getDataLayout();
+
+    sea_dsa::GlobalAnalysis* global_sea_dsa = nullptr;
+    // The factory must be alive while global_sea_dsa is in use
+    sea_dsa::ContextInsensitiveGlobalAnalysis::SetFactory fac;
+    
+    switch (CrabHeapAnalysis) {
+    case LLVM_DSA:
+      #ifdef HAVE_DSA
+      m_mem.reset
+	(new LlvmDsaHeapAbstraction(M,&getAnalysis<SteensgaardDataStructures>(),
+				    CrabDsaDisambiguateUnknown,
+				    CrabDsaDisambiguatePtrCast,
+				    CrabDsaDisambiguateExternal));
+      break;
+      #else
+      // execute CI_SEA_DSA
+      #endif      
+    case CI_SEA_DSA:
+    case CS_SEA_DSA: {
+      sea_dsa::GlobalAnalysisKind kind = sea_dsa::CONTEXT_INSENSITIVE;
+      if (CrabHeapAnalysis == CS_SEA_DSA) {
+	kind = sea_dsa::CONTEXT_SENSITIVE;
+      }
+      // XXX: We don't run sea-dsa as a LLVM pass because we don't
+      // want the pass manager to run the sea-dsa analysis if user
+      // selects llvm-dsa.
+      CallGraph& cg = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+      CRAB_VERBOSE_IF(1, llvm::errs() << "Started sea-dsa analysis.\n";);      
+      if (kind == sea_dsa::CONTEXT_INSENSITIVE) {
+	global_sea_dsa = new sea_dsa::ContextInsensitiveGlobalAnalysis(dl, *m_tli,
+								       cg, fac, false);
+      } else {
+	global_sea_dsa = new sea_dsa::ContextSensitiveGlobalAnalysis(dl, *m_tli, cg, fac);
+      }
+      global_sea_dsa->runOnModule(M);
+      CRAB_VERBOSE_IF(1, llvm::errs() << "Finished sea-dsa analysis.\n";);
+      m_mem.reset
+	(new SeaDsaHeapAbstraction(M, global_sea_dsa,
+				   CrabDsaDisambiguateUnknown,
+				   CrabDsaDisambiguatePtrCast,
+				   CrabDsaDisambiguateExternal));
+      }
+      break;
+    default:
+      errs() << "Warning: running crab-llvm without memory analysis\n";
+    }
+
+    CRAB_VERBOSE_IF(1, llvm::errs() << "Using "  << m_mem->getName() << "\n";);
+    
+    m_params.dom = CrabLlvmDomain;
+    m_params.sum_dom = CrabSummDomain;
+    m_params.run_backward = CrabBackward;
+    m_params.run_liveness = CrabLive;
+    m_params.relational_threshold = CrabRelationalThreshold;
+    m_params.widening_delay = CrabWideningDelay;
+    m_params.narrowing_iters = CrabNarrowingIters;
+    m_params.widening_jumpset = CrabWideningJumpSet;
+    m_params.stats = CrabStats;
+    m_params.print_invars = CrabPrintAns;
+    m_params.print_preconds = CrabPrintPreCond;
+    m_params.print_unjustified_assumptions = CrabPrintUnjustifiedAssumptions;
+    m_params.print_summaries = CrabPrintSumm;
+    m_params.store_invariants = CrabStoreInvariants;
+    m_params.keep_shadow_vars = CrabKeepShadows;
+    m_params.check = CrabCheck;
+    m_params.check_verbose = CrabCheckVerbose;
+        
+    if (CrabInter){
+      InterCrabLlvm_Impl inter_crab(M, CrabTrackLev, m_mem, m_vfac, m_cfg_man, *m_tli);
+      InvarianceAnalysisResults results = { m_pre_map, m_post_map, m_checks_db};
+      inter_crab.Analyze(m_params, assumption_map_t(), results);
+    } else {
       for (auto &f : M) {
         runOnFunction (f); 
       }
     }
 
+    if (global_sea_dsa) {
+      delete global_sea_dsa;
+    }
+    
     if (CrabStats) {
       crab::CrabStats::PrintBrunch (crab::outs());
     }
@@ -1136,35 +1526,8 @@ namespace crab_llvm {
         llvm::outs() << "************** BRUNCH STATS END *****************\n\n";
       }
     }
-   return false;
-  }
-
-
-  bool CrabLlvmPass::runOnFunction (Function &F) {
-    if (!CrabInter && isTrackable(F)) {
-      const TargetLibraryInfo &tli = getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
-      IntraCrabLlvm_Impl crab(F, CrabTrackLev, m_mem, m_vfac, tli);
-      m_cfg_map[&F] = crab.Cfg();
-      AnalysisParams params;
-      params.dom = CrabLlvmDomain;
-      params.run_backward = CrabBackward;
-      params.run_liveness = CrabLive;
-      params.relational_threshold = CrabRelationalThreshold;
-      params.widening_delay = CrabWideningDelay;
-      params.narrowing_iters = CrabNarrowingIters;
-      params.widening_jumpset = CrabWideningJumpSet;
-      params.stats = CrabStats;
-      params.print_invars = CrabPrintAns;
-      params.print_preconds = CrabPrintPreCond;
-      params.print_assumptions = CrabPrintAssumptions;
-      params.keep_shadow_vars = CrabKeepShadows;
-      params.check = CrabCheck;
-      params.check_verbose = CrabCheckVerbose;
-      InvarianceAnalysisResults results = { m_pre_map, m_post_map, m_checks_db};
-      crab.Analyze(params, assumption_map_t(), results);
-    }
     
-    return false;
+   return false;
   }
 
   void CrabLlvmPass::getAnalysisUsage (AnalysisUsage &AU) const {
@@ -1175,17 +1538,21 @@ namespace crab_llvm {
     AU.addRequired<TargetLibraryInfoWrapperPass>();
     AU.addRequired<UnifyFunctionExitNodes>();
     AU.addRequired<crab_llvm::NameValues>();
+    AU.addRequired<CallGraphWrapperPass>();
+    AU.addPreserved<CallGraphWrapperPass>();
   } 
   
   /**
    * For crab-llvm clients
    **/
+
+  bool CrabLlvmPass::has_cfg(llvm::Function &F) {
+    return m_cfg_man.has_cfg(F);
+  }
   
-  cfg_ptr_t CrabLlvmPass::get_cfg(llvm::Function* F) {
-    auto it = m_cfg_map.find (F);
-    if (it != m_cfg_map.end ())
-      return it->second;
-    return nullptr;
+  cfg_ref_t CrabLlvmPass::get_cfg(llvm::Function &F) {
+    assert(m_cfg_man.has_cfg(F));
+    return m_cfg_man[F];
   }
   
   // return invariants that hold at the entry of block
@@ -1219,15 +1586,15 @@ namespace crab_llvm {
   }
 
   unsigned CrabLlvmPass::get_total_safe_checks () const {
-    return (m_checks_db ? m_checks_db->get_total_safe() : 0);
+    return m_checks_db.get_total_safe();
   }
 
   unsigned CrabLlvmPass::get_total_error_checks () const {
-    return (m_checks_db ? m_checks_db->get_total_error() : 0);
+    return m_checks_db.get_total_error();
   }
 
   unsigned CrabLlvmPass::get_total_warning_checks () const {
-    return (m_checks_db ? m_checks_db->get_total_warning() : 0);
+    return m_checks_db.get_total_warning();
   }
 
   void CrabLlvmPass::print_checks (raw_ostream &o) const {

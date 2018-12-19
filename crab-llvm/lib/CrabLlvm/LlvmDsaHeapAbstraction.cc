@@ -1,7 +1,9 @@
 #include "crab_llvm/config.h"
 
+#ifdef HAVE_DSA
 /**
- * This heap abstraction helps to reason about memory contents.
+ * This heap abstraction helps to reason about memory contents based
+ * on llvm-dsa (https://github.com/seahorn/llvm-dsa).
  * 
  * It only disambiguates pointers that contain integers or arrays
  * whose elements are integers. Although this is restrictive there are
@@ -15,8 +17,6 @@
  *   type but if only an integer field is used in the program then
  *   it's considered as an array of integers.
  */
-
-#ifdef HAVE_DSA
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Value.h"
@@ -28,7 +28,7 @@
 #include "dsa/DSGraph.h"
 #include "dsa/DSNode.h"
 
-#include "crab_llvm/HeapAbstraction.hh"
+#include "crab_llvm/LlvmDsaHeapAbstraction.hh"
 #include "crab/common/debug.hpp"
 
 #include <set>
@@ -124,7 +124,7 @@ namespace crab_llvm {
     auto it = n->type_begin();
     if (it->first != 0) return false;
 
-    // Check that all types of the array are integers
+    // Check that all types of the array satisfy is_typed
     for (auto ty: *(it->second))
       if (!is_typed(ty)) return false;
     
@@ -234,28 +234,27 @@ namespace crab_llvm {
   /// outReach - subset of reach that is only reachable from the return node
   template <typename Set1, typename Set2>
   static void argReachableNodesFromCall(llvm::DSCallSite CS,
-				llvm::DSGraph &dsg, 
-				Set1 &reach, Set2 &outReach) {
+					llvm::DSGraph &dsg, 
+					Set1 &reach, Set2 &outReach) {
     inputReachableNodes(CS, dsg, reach);
     retReachableNodes(CS, outReach);
     set_difference(outReach, reach);
     set_union(reach, outReach);
   }
 
+  template <typename Set1, typename Set2>
+  static void argReachableNodes(const llvm::Function&f, llvm::DSGraph* g,
+				Set1 &reach, Set2 &outReach) {
+    llvm::DSCallSite CCS = g->getCallSiteForArguments(f);
+    argReachableNodesFromCall(CCS, *g, reach, outReach);
+  }
+  
   ///////
   // class methods
   ///////
   
-  template <typename Set1, typename Set2>
-  void LlvmDsaHeapAbstraction::argReachableNodes(llvm::Function&f,
-						 Set1 &reach, Set2 &outReach) {
-    llvm::DSGraph *cdsg = m_dsa->getDSGraph(f);
-    if (cdsg) {
-      llvm::DSCallSite CCS = cdsg->getCallSiteForArguments(f);
-      argReachableNodesFromCall(CCS, *cdsg, reach, outReach);
-    }
-  }
-  
+
+  // field-sensitive: assigns an id to each offset
   int LlvmDsaHeapAbstraction::getId(const llvm::DSNode *n, unsigned offset) {
     auto it = m_node_ids.find(n);
     if (it != m_node_ids.end()) return it->second + offset;
@@ -284,7 +283,7 @@ namespace crab_llvm {
   // compute and cache the set of read, mod and new nodes of a whole
   // function such that mod nodes are a subset of the read nodes and
   // the new nodes are disjoint from mod nodes.
-  void  LlvmDsaHeapAbstraction::cacheReadModNewNodes(llvm::Function& f) {
+  void  LlvmDsaHeapAbstraction::cacheReadModNewNodes(const llvm::Function& f) {
     
     if (!m_dsa) return;
     
@@ -293,7 +292,9 @@ namespace crab_llvm {
     if (f.getName().startswith("shadow.mem")) return;
     
     std::set<const llvm::DSNode*> reach, retReach;
-    argReachableNodes(f, reach, retReach);
+    if (llvm::DSGraph *g = m_dsa->getDSGraph(f)) {
+      argReachableNodes(f, g, reach, retReach);
+    }
     
     //CRAB_LOG("heap-abs", llvm::errs() << f.getName() << "\n");
     
@@ -340,7 +341,7 @@ namespace crab_llvm {
     /// ignore inline assembly
     if (I.isInlineAsm()) return;
 
-    llvm::Function* Called = llvm::CallSite(&I).getCalledFunction();
+    const llvm::Function* Called = llvm::CallSite(&I).getCalledFunction();
 
     if (!Called) {
       //llvm::errs () << "CRABLLVM WARNING: DSA cannot resolve " << I << "\n";
@@ -368,8 +369,10 @@ namespace crab_llvm {
     std::set<const llvm::DSNode*> reach;
     std::set<const llvm::DSNode*> retReach;
     argReachableNodesFromCall(CCS, *cdsg, reach, retReach);
-    //llvm::DSGraph::NodeMapTy nodeMap;
-    //dsg->computeCalleeCallerMapping(CS, CF, *cdsg, nodeMap);
+    // XXX: assume that DSA analysis is context-insensitive
+    // 
+    //  llvm::DSGraph::NodeMapTy nodeMap;
+    //  dsg->computeCalleeCallerMapping(CS, CF, *cdsg, nodeMap);
     
     region_set_t reads, mods, news;
     for (const llvm::DSNode* n : reach) {
@@ -422,7 +425,7 @@ namespace crab_llvm {
     //     callsites
     
     CRAB_LOG("heap-abs", 
-	     llvm::errs() << "========= HeapAbstraction =========\n");
+	     llvm::errs() << "========= HeapAbstraction using llvm-dsa =========\n");
     
     for (auto &F: boost::make_iterator_range(m_M)) {
       cacheReadModNewNodes(F);
@@ -439,7 +442,7 @@ namespace crab_llvm {
 
   // f is used to know in which DSGraph we should search for V
   LlvmDsaHeapAbstraction::region_t
-  LlvmDsaHeapAbstraction::getRegion(llvm::Function& F, llvm::Value* V)  {
+  LlvmDsaHeapAbstraction::getRegion(const llvm::Function& F, llvm::Value* V)  {
     // Note each function has its own graph and a copy of the global
     // graph. Nodes in both graphs are merged.  However, m_dsa has
     // its own global graph which seems not to be merged with
@@ -478,12 +481,12 @@ namespace crab_llvm {
   }
   
   LlvmDsaHeapAbstraction::region_set_t
-  LlvmDsaHeapAbstraction::getAccessedRegions(llvm::Function& F)  {
+  LlvmDsaHeapAbstraction::getAccessedRegions(const llvm::Function& F)  {
     return m_func_accessed [&F];
   }
 
   LlvmDsaHeapAbstraction::region_set_t
-  LlvmDsaHeapAbstraction::getOnlyReadRegions(llvm::Function& F)  {
+  LlvmDsaHeapAbstraction::getOnlyReadRegions(const llvm::Function& F)  {
     region_set_t s1 = m_func_accessed [&F];
     region_set_t s2 = m_func_mods [&F];
     set_difference(s1,s2);
@@ -491,12 +494,12 @@ namespace crab_llvm {
   }
   
   LlvmDsaHeapAbstraction::region_set_t
-  LlvmDsaHeapAbstraction::getModifiedRegions(llvm::Function& F) {
+  LlvmDsaHeapAbstraction::getModifiedRegions(const llvm::Function& F) {
     return m_func_mods [&F];
   }
   
   LlvmDsaHeapAbstraction::region_set_t
-  LlvmDsaHeapAbstraction::getNewRegions(llvm::Function& F) {
+  LlvmDsaHeapAbstraction::getNewRegions(const llvm::Function& F) {
     return m_func_news [&F];
   }
   

@@ -1,4 +1,4 @@
-// RUN: %crabllvm -O0 --lower-unsigned-icmp --crab-dom=zones --crab-check=assert "%s" 2>&1 | OutputCheck %s
+// RUN: %crabllvm -O0 --crab-dom=zones --crab-check=assert --crab-sanity-checks "%s" 2>&1 | OutputCheck %s
 // CHECK: ^2  Number of total safe checks$
 // CHECK: ^0  Number of total error checks$
 // CHECK: ^0  Number of total warning checks$
@@ -16,14 +16,8 @@ int main (){
     y++;
   }
 
-  // domains might have problems with disequality when proving the
-  // assertion
-  //__CRAB_assert(x==y);
-  
   __CRAB_assert(x>=y);
   __CRAB_assert(y>=x);
-
-  //if (x != y) __SEAHORN_error(5);
 
   return x+y;
 }

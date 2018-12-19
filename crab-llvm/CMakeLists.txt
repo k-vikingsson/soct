@@ -42,6 +42,14 @@ endif ()
 #### crab-llvm options ######
 option (USE_COTIRE "Use cotire to speed up compilation time" OFF)
 option (BUILD_CRABLLVM_LIBS_SHARED "Build all CrabLlvm libraries shared." OFF)
+
+option (COMPILE_ALL_DOMAINS "Compile all abstract domains." ON)
+if (COMPILE_ALL_DOMAINS)
+  set (HAVE_ALL_DOMAINS TRUE)
+else ()
+  message(STATUS "Some abstract domains are disabled to speed up compilation time.")
+  set (HAVE_ALL_DOMAINS FALSE)
+endif ()
 #### end crab-llvm options ######
 
 # Add path for custom modules
@@ -106,15 +114,19 @@ if (GIT_FOUND)
   if (TopLevel)
     set (LLVM_DSA_REPO "https://github.com/seahorn/llvm-dsa"
       CACHE STRING "llvm-dsa repo")
+    set (SEA_DSA_REPO "https://github.com/seahorn/sea-dsa"
+      CACHE STRING "sea-dsa repo")
     set (SEAHORN_LLVM_REPO "https://github.com/seahorn/llvm-seahorn"
       CACHE STRING "seahorn-llvm repo")
 
     add_custom_target (llvm-dsa-git
       ${GIT_EXECUTABLE} clone ${LLVM_DSA_REPO} ${CMAKE_SOURCE_DIR}/llvm-dsa)
+    add_custom_target (sea-dsa-git
+      ${GIT_EXECUTABLE} clone ${SEA_DSA_REPO} ${CMAKE_SOURCE_DIR}/sea-dsa)
     add_custom_target (seahorn-llvm-git
       ${GIT_EXECUTABLE} clone ${SEAHORN_LLVM_REPO} ${CMAKE_SOURCE_DIR}/llvm-seahorn)
-
-    add_custom_target (extra DEPENDS llvm-dsa-git seahorn-llvm-git)
+    
+    add_custom_target (extra DEPENDS llvm-dsa-git sea-dsa-git seahorn-llvm-git)
   endif ()
 
   set (CRAB_REPO "https://github.com/seahorn/crab.git" CACHE STRING "crab repo")
@@ -128,9 +140,10 @@ if (GIT_FOUND)
   
 #  add_custom_target (crab-git
 #     		     ${GIT_EXECUTABLE} clone ${CRAB_REPO} ${CRAB_ROOT})
- 
-  add_custom_target (crab-git 
-                    ln -s ${CRAB_LOCAL} ${CRAB_ROOT})
+
+  add_custom_target (crab-git
+               ln -s ${CRAB_LOCAL} ${CRAB_ROOT})
+
   add_custom_target (crab ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_LIST_FILE}
                      DEPENDS crab-git)    
 
@@ -237,13 +250,20 @@ if (TopLevel)
     set (DSA_LIBS DSA AssistDS)
     set (HAVE_DSA TRUE)
   else()
-    message (WARNING "No DSA found in ${CMAKE_SOURCE_DIR}/llvm-dsa")
+    message (WARNING "No DSA found in ${CMAKE_SOURCE_DIR}/llvm-dsa. Run\n\tcmake --build . --target extra && cmake ${CMAKE_SOURCE_DIR}")
     set (DSA_LIBS "")
   endif()
-endif ()
 
-
-if (TopLevel)
+  if (IS_DIRECTORY ${CMAKE_SOURCE_DIR}/sea-dsa AND
+      EXISTS ${CMAKE_SOURCE_DIR}/sea-dsa/src/DsaAnalysis.cc)
+    include_directories (BEFORE sea-dsa/include)
+    add_subdirectory (${CMAKE_SOURCE_DIR}/sea-dsa)
+    set (SEA_DSA_LIBS SeaDsaAnalysis)
+  else()
+    message (WARNING "No SEA DSA found in ${CMAKE_SOURCE_DIR}/sea-dsa. Run\n\tcmake --build . --target extra && cmake ${CMAKE_SOURCE_DIR}")
+    set (SEA_DSA_LIBS "")
+  endif()
+  
   if (IS_DIRECTORY ${CMAKE_SOURCE_DIR}/llvm-seahorn AND
       EXISTS ${CMAKE_SOURCE_DIR}/llvm-seahorn/lib/CMakeLists.txt)
     include_directories (BEFORE llvm-seahorn/include)
@@ -251,6 +271,8 @@ if (TopLevel)
     add_subdirectory(llvm-seahorn/tools)
     set (HAVE_LLVM_SEAHORN TRUE)
     set (LLVM_SEAHORN_LIBS SeaInstCombine SeaLoops SeaInstNondet)
+  else()
+    message (WARNING "No LLVM-SEAHORN found in ${CMAKE_SOURCE_DIR}/llvm-seahorn. Run\n\tcmake --build . --target extra && cmake ${CMAKE_SOURCE_DIR}")
   endif()
 endif ()
 
