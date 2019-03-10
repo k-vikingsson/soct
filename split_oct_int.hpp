@@ -819,6 +819,11 @@ namespace crab {
 	  assert(check_potential(graph, potential));
 	  close_over_edge(src, dest);
 	  close_over_edge(dest+1, src+1);
+          tighten();
+          if(!check_z_consistent()) {
+	    set_to_bottom();
+	    return false;
+	  }
 	  //assert(check_potential(graph, potential));
 	}
 				
@@ -843,6 +848,11 @@ namespace crab {
 	  assert(check_potential(graph, potential));
 	  close_over_edge(src, dest+1);
 	  close_over_edge(dest, src+1);
+          tighten();
+          if(!check_z_consistent()) {
+	    set_to_bottom();
+	    return false;
+	  }
 	  //assert(check_potential(graph, potential));
 	}
 				
@@ -867,6 +877,11 @@ namespace crab {
 	  assert(check_potential(graph, potential));
 	  close_over_edge(src+1, dest);
 	  close_over_edge(dest+1, src);
+          tighten();
+          if(!check_z_consistent()) {
+	    set_to_bottom();
+	    return false;
+	  }
 	  //assert(check_potential(graph, potential));
 	}
 	// Collect bounds
@@ -879,6 +894,11 @@ namespace crab {
 	  if (v % 2 != 0) continue;
 	  GrOps::close_after_assign(graph, potential, v, delta);
 	  GrOps::update_delta(graph, delta);
+          tighten();
+          if(!check_z_consistent()) {
+	    set_to_bottom();
+	    return false;
+	  }
 	}
         #endif
 
@@ -1110,6 +1130,35 @@ namespace crab {
             #endif
 	  }
 	}
+      }
+      
+      void tighten(){
+        typename graph_t::mut_val_ref_t lb;
+        typename graph_t::mut_val_ref_t ub;
+
+        for (auto var : vert_map){
+          vert_id pos = var.second.first;
+          vert_id neg = var.second.second;
+          if(graph.lookup(pos, neg, &lb) && graph.lookup(neg, pos, &ub)){
+            Wt nlb = 2 * int(lb / 2);
+            Wt nub = 2 * int(ub / 2);
+            graph.set_edge(pos, nlb, neg);
+            graph.set_edge(neg, nub, pos);
+          }
+        }
+      }
+      
+      bool check_z_consistent(){
+        typename graph_t::mut_val_ref_t lb;
+        typename graph_t::mut_val_ref_t ub;
+        for (auto var : vert_map){
+          vert_id pos = var.second.first;
+          vert_id neg = var.second.second;
+          if(graph.lookup(pos, neg, &lb) && graph.lookup(neg, pos, &ub)){
+            if (lb + ub < 0) return false;
+          }
+        }
+        return true;
       }
 
       
@@ -1488,6 +1537,11 @@ namespace crab {
 				 d, min_op);
 	    }
 	  }
+	  tighten();
+          if(!check_z_consistent()) {
+	    set_to_bottom();
+	    return false;
+	  }
 
 	  // Conjecture: join_g remains closed.
 	  // Now garbage collect any unused vertices
@@ -1693,6 +1747,11 @@ namespace crab {
 	    GrOps::close_after_assign(meet_g, meet_pi, 0, delta);
 	    GrOps::update_delta(meet_g, delta);
             #endif
+            tighten();
+            if(!check_z_consistent()) {
+	      set_to_bottom();
+	      return false;
+	    } 
 	  }
 					
 	  assert(check_potential(meet_g, meet_pi)); 
@@ -1919,6 +1978,10 @@ namespace crab {
 	  GrOps::close_after_widen(g_oct,potential, vert_set_wrap_t(unstable), delta);
 	else GrOps::close_johnson(g_oct, potential, delta);
 	GrOps::update_delta(graph, delta);
+        tighten();
+        if(!check_z_consistent()) {
+          set_to_bottom();
+        }
 
 	unstable.clear();
       }

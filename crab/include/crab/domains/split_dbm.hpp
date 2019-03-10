@@ -26,10 +26,10 @@
 #include <crab/domains/graphs/pt_graph.hpp>
 #include <crab/domains/graphs/graph_ops.hpp>
 #include <crab/domains/linear_constraints.hpp>
-#include <crab/domains/intervals.hpp>
+#include <crab/domains/interval.hpp>
 #include <crab/domains/patricia_trees.hpp>
-#include <crab/domains/operators_api.hpp>
-#include <crab/domains/domain_traits.hpp>
+#include <crab/domains/abstract_domain.hpp>
+#include <crab/domains/abstract_domain_specialized_traits.hpp>
 
 #include <type_traits>
 
@@ -178,10 +178,10 @@ namespace crab {
 
 
     template<class Number, class VariableName, class Params = SDBM_impl::DefaultParams<Number>>
-    class SplitDBM_ :
-      public abstract_domain<Number, VariableName, SplitDBM_<Number,VariableName,Params>> {
+    class SplitDBM_ final:
+      public abstract_domain<SplitDBM_<Number,VariableName,Params>> {
       typedef SplitDBM_<Number, VariableName, Params> DBM_t;
-      typedef abstract_domain<Number, VariableName, DBM_t> abstract_domain_t;
+      typedef abstract_domain<DBM_t> abstract_domain_t;
       
      public:
       using typename abstract_domain_t::linear_expression_t;
@@ -189,18 +189,19 @@ namespace crab {
       using typename abstract_domain_t::linear_constraint_system_t;
       using typename abstract_domain_t::disjunctive_linear_constraint_system_t;      
       using typename abstract_domain_t::variable_t;
-      using typename abstract_domain_t::number_t;
-      using typename abstract_domain_t::varname_t;
       using typename abstract_domain_t::variable_vector_t;
+      using typename abstract_domain_t::pointer_constraint_t;
+      typedef Number number_t;
+      typedef VariableName varname_t;
       
       typedef typename linear_constraint_t::kind_t constraint_kind_t;
-      typedef interval<Number>  interval_t;
+      typedef interval<number_t>  interval_t;
 
      private:
-      typedef bound<Number>  bound_t;
+      typedef bound<number_t>  bound_t;
       typedef typename Params::Wt Wt;
       typedef typename Params::graph_t graph_t;
-      typedef SDBM_impl::NtoV<Number, Wt> ntov;
+      typedef SDBM_impl::NtoV<number_t, Wt> ntov;
       typedef typename graph_t::vert_id vert_id;
       typedef boost::container::flat_map<variable_t, vert_id> vert_map_t;
       typedef typename vert_map_t::value_type vmap_elt_t;
@@ -212,7 +213,7 @@ namespace crab {
       typedef std::pair< std::pair<variable_t, variable_t>, Wt > diffcst_t;
       typedef boost::unordered_set<vert_id> vert_set_t;
 
-      protected:
+    protected:
         
       //================
       // Domain data
@@ -224,47 +225,6 @@ namespace crab {
       std::vector<Wt> potential; // Stored potential for the vertex
       vert_set_t unstable;
       bool _is_bottom;
-
-
-      void set_to_bottom() {
-        vert_map.clear();
-        rev_map.clear();
-        g.clear();
-        potential.clear();
-        unstable.clear();
-        _is_bottom = true;
-      }
-
-      boost::optional<std::pair<vert_id,std::pair<vert_id, Wt>>>
-      diffcst_of_leq(linear_constraint_t cst) {
-
-        assert (cst.size() > 0);
-        assert (cst.is_inequality());
-
-        std::vector<std::pair<vert_id,std::pair<vert_id, Wt>>> diffcsts;
-
-        typename linear_expression_t::iterator it1 = cst.begin();
-        typename linear_expression_t::iterator it2 = ++cst.begin();
-        vert_id i, j;
-        
-        if (cst.size() == 1 && it1->first == 1) {
-          i = get_vert(it1->second);
-          j = 0;
-        } else if (cst.size() == 1 && it1->first == -1) {
-          i = 0;
-          j = get_vert(it1->second);
-        } else if (cst.size() == 2 && it1->first == 1 && it2->first == -1) {
-          i = get_vert(it1->second);
-          j = get_vert(it2->second);
-        } else if (cst.size() == 2 && it1->first == -1 && it2->first == 1) {
-          i = get_vert(it2->second);
-          j = get_vert(it1->second);
-        } else { 
-          // the constraint cannot be expressed as a difference constraint
-          return boost::none;
-        }
-        return std::make_pair(j, std::make_pair(i, Wt(cst.constant())));
-      }
 
       class Wt_max {
       public:
@@ -395,204 +355,187 @@ namespace crab {
 	for (typename linear_expression_t::iterator it = e.begin(); it != e.end(); ++it) {
 	  variable_t v = it->second;
 	  if (v.index() != pivot.index()) {
-	    residual = residual - (interval_t (it->first) * this->operator[](v));
+	    residual = residual - (interval_t(it->first) * this->operator[](v));
 	  }
 	}
 	return residual;
+      }
+
+      /**
+       *  Turn an assignment into a set of difference constraints.
+       * 
+       *  Given v := a*x + b*y + k, where a,b >= 0, we generate the
+       *  difference constraints:
+       * 
+       *  if extract_upper_bounds
+       *     v - x <= ub((a-1)*x + b*y + k)
+       *     v - y <= ub(a*x + (b-1)*y + k)
+       *  else
+       *     x - v <= lb((a-1)*x + b*y + k)
+       *     y - v <= lb(a*x + (b-1)*y + k)
+       **/ 
+      void diffcsts_of_assign(variable_t x, linear_expression_t exp,
+			      /* if true then process the upper
+				 bounds, else the lower bounds */
+			      bool extract_upper_bounds,
+			      /* foreach {v, k} \in diff_csts we have
+				 the difference constraint v - k <= k */
+			      std::vector<std::pair<variable_t, Wt>>& diff_csts) {
+
+	boost::optional<variable_t> unbounded_var;
+	std::vector< std::pair<variable_t, Wt>> terms;	
+	Wt residual(ntov::ntov(exp.constant()));
+	for(auto p : exp) {
+	  Wt coeff(ntov::ntov(p.first));
+	  variable_t y(p.second);	    
+	  
+	  if(p.first < Wt(0)) {
+	    // Can't do anything with negative coefficients.
+	    bound_t y_val = (extract_upper_bounds ?
+			     operator[](y).lb():
+			     operator[](y).ub());
+	    
+	    if(y_val.is_infinite()) {
+	      return;
+	    }
+	    residual += ntov::ntov(*(y_val.number()))*coeff;
+	  } else {
+	    bound_t y_val = (extract_upper_bounds ?
+			     operator[](y).ub():
+			     operator[](y).lb());
+
+	    if(y_val.is_infinite()) {
+	      if(unbounded_var || coeff != Wt(1)) {
+		return;
+	      }
+	      unbounded_var = y;
+	    } else {
+	      Wt ymax(ntov::ntov(*(y_val.number())));
+	      residual += ymax*coeff;
+	      terms.push_back({y, ymax});
+	    }
+	  }
+	}
+	
+	if(unbounded_var) {
+	  // There is exactly one unbounded variable with unit
+	  // coefficient
+	  diff_csts.push_back({*unbounded_var, residual});
+	} else {
+	  for(auto p : terms) {
+	    diff_csts.push_back({p.first, residual - p.second});
+	  }
+	}
       }
       
       // Turn an assignment into a set of difference constraints.
       void diffcsts_of_assign(variable_t x, linear_expression_t exp,
 			      std::vector<std::pair<variable_t, Wt>>& lb,
 			      std::vector<std::pair<variable_t,Wt>>& ub) {
-        {
-          // Process upper bounds.
-          boost::optional<variable_t> unbounded_ubvar;
-          Wt exp_ub(ntov::ntov(exp.constant()));
-          std::vector< std::pair<variable_t, Wt>> ub_terms;
-          for(auto p : exp)
-          {
-            Wt coeff(ntov::ntov(p.first));
-            if(p.first < Wt(0))
-            {
-              // Can't do anything with negative coefficients.
-              bound_t y_lb = operator[](p.second).lb();
-              if(y_lb.is_infinite())
-                goto assign_ub_finish;
-              exp_ub += ntov::ntov(*(y_lb.number()))*coeff;
-            } else {
-              variable_t y(p.second);
-              bound_t y_ub = operator[](y).ub(); 
-              if(y_ub.is_infinite())
-              {
-                if(unbounded_ubvar || coeff != Wt(1))
-                  goto assign_ub_finish;
-                unbounded_ubvar = y;
-              } else {
-                Wt ymax(ntov::ntov(*(y_ub.number())));
-                exp_ub += ymax*coeff;
-                ub_terms.push_back(std::make_pair(y, ymax));
-              }
-            }
-          }
-
-          if(unbounded_ubvar)
-          {
-            // There is exactly one unbounded variable. 
-            ub.push_back(std::make_pair(*unbounded_ubvar, exp_ub));
-          } else {
-            for(auto p : ub_terms)
-            {
-              ub.push_back(std::make_pair(p.first, exp_ub - p.second));
-            }
-          }
-        }
-      assign_ub_finish:
-
-        {
-          boost::optional<variable_t> unbounded_lbvar;
-          Wt exp_lb(ntov::ntov(exp.constant()));
-          std::vector< std::pair<variable_t, Wt>> lb_terms;
-          for(auto p : exp)
-          {
-            Wt coeff(ntov::ntov(p.first));
-            if(p.first < Wt(0))
-            {
-              // Again, can't do anything with negative coefficients.
-              bound_t y_ub = operator[](p.second).ub();
-              if(y_ub.is_infinite())
-                goto assign_lb_finish;
-              exp_lb += (ntov::ntov(*(y_ub.number())))*coeff;
-            } else {
-              variable_t y(p.second);
-              bound_t y_lb = operator[](y).lb(); 
-              if(y_lb.is_infinite())
-              {
-                if(unbounded_lbvar || coeff != Wt(1))
-                  goto assign_lb_finish;
-                unbounded_lbvar = y;
-              } else {
-                Wt ymin(ntov::ntov(*(y_lb.number())));
-                exp_lb += ymin*coeff;
-                lb_terms.push_back(std::make_pair(y, ymin));
-              }
-            }
-          }
-
-          if(unbounded_lbvar)
-          {
-            lb.push_back(std::make_pair(*unbounded_lbvar, exp_lb));
-          } else {
-            for(auto p : lb_terms)
-            {
-              lb.push_back(std::make_pair(p.first, exp_lb - p.second));
-            }
-          }
-        }
-      assign_lb_finish:
-        return;
+	diffcsts_of_assign(x, exp, true, ub);
+	diffcsts_of_assign(x, exp, false, lb);
       }
-   
-      // GKG: I suspect there're some sign/bound direction errors in the 
-      // following.
-      void diffcsts_of_lin_leq(const linear_expression_t& exp, std::vector<diffcst_t>& csts,
-			       std::vector<std::pair<variable_t, Wt> >& lbs,
-			       std::vector<std::pair<variable_t, Wt> >& ubs) {
-        // Process upper bounds.
+
+      /**
+       * Turn a linear inequality into a set of difference
+       * constraints.
+       **/
+      void diffcsts_of_lin_leq(const linear_expression_t& exp,
+			       /* difference contraints */
+			       std::vector<diffcst_t>& csts,
+			       /* x >= lb for each {x,lb} in lbs */
+			       std::vector<std::pair<variable_t, Wt>>& lbs,
+			       /* x <= ub for each {x,ub} in ubs */
+			       std::vector<std::pair<variable_t, Wt>>& ubs) {
+	
         Wt unbounded_lbcoeff;
         Wt unbounded_ubcoeff;
         boost::optional<variable_t> unbounded_lbvar;
         boost::optional<variable_t> unbounded_ubvar;
         Wt exp_ub = - (ntov::ntov(exp.constant()));
-        std::vector< std::pair< std::pair<Wt, variable_t>, Wt> > pos_terms;
-        std::vector< std::pair< std::pair<Wt, variable_t>, Wt> > neg_terms;
-        for(auto p : exp)
-        {
+        std::vector<std::pair<std::pair<Wt, variable_t>, Wt>> pos_terms;
+        std::vector<std::pair<std::pair<Wt, variable_t>, Wt>> neg_terms;
+        for(auto p : exp) {
           Wt coeff(ntov::ntov(p.first));
-          if(coeff > Wt(0))
-          {
+          if(coeff > Wt(0)) {
             variable_t y(p.second);
             bound_t y_lb = operator[](y).lb();
-            if(y_lb.is_infinite())
-            {
-              if(unbounded_lbvar)
-                goto diffcst_finish;
+            if(y_lb.is_infinite()) {
+              if(unbounded_lbvar) {
+                return;
+	      }
               unbounded_lbvar = y;
               unbounded_lbcoeff = coeff;
             } else {
               Wt ymin(ntov::ntov(*(y_lb.number())));
-              // Coeff is negative, so it's still add
               exp_ub -= ymin*coeff;
-              pos_terms.push_back(std::make_pair(std::make_pair(coeff, y), ymin));
+              pos_terms.push_back({{coeff, y}, ymin});
             }
           } else {
             variable_t y(p.second);
             bound_t y_ub = operator[](y).ub(); 
-            if(y_ub.is_infinite())
-            {
-              if(unbounded_ubvar)
-                goto diffcst_finish;
+            if(y_ub.is_infinite()) {
+              if(unbounded_ubvar) {
+                return;
+	      }
               unbounded_ubvar = y;
               unbounded_ubcoeff = -(ntov::ntov(coeff));
             } else {
               Wt ymax(ntov::ntov(*(y_ub.number())));
               exp_ub -= ymax*coeff;
-              neg_terms.push_back(std::make_pair(std::make_pair(-coeff, y), ymax));
+              neg_terms.push_back({{-coeff, y}, ymax});
             }
           }
         }
 
-        if(unbounded_lbvar)
-        {
+        if(unbounded_lbvar) {
           variable_t x(*unbounded_lbvar);
-          if(unbounded_ubvar)
-          {
-            if(unbounded_lbcoeff != Wt(1) || unbounded_ubcoeff != Wt(1))
-              goto diffcst_finish;
+          if(unbounded_ubvar) {
+            if(unbounded_lbcoeff != Wt(1) || unbounded_ubcoeff != Wt(1)) {
+              return;
+	    }
             variable_t y(*unbounded_ubvar);
-            csts.push_back(std::make_pair(std::make_pair(x, y), exp_ub));
+            csts.push_back({{x, y}, exp_ub});
           } else {
-            if(unbounded_lbcoeff == Wt(1))
-            {
-              for(auto p : neg_terms)
-                csts.push_back(std::make_pair(std::make_pair(x, p.first.second),
-					      exp_ub - p.second));
+            if(unbounded_lbcoeff == Wt(1)) {
+              for(auto p : neg_terms) {
+                csts.push_back({{x, p.first.second}, exp_ub - p.second});
+	      }
             }
             // Add bounds for x
-            ubs.push_back(std::make_pair(x, exp_ub/unbounded_lbcoeff));
+            ubs.push_back({x, exp_ub/unbounded_lbcoeff});
           }
         } else {
-          if(unbounded_ubvar)
-          {
+          if(unbounded_ubvar) {
             variable_t y(*unbounded_ubvar);
-            if(unbounded_ubcoeff == Wt(1))
-            {
-              for(auto p : pos_terms)
-                csts.push_back(std::make_pair(std::make_pair(p.first.second, y),
-					      exp_ub + p.second));
-            }
-            // Bounds for y
-            lbs.push_back(std::make_pair(y, -exp_ub/unbounded_ubcoeff));
+            if(unbounded_ubcoeff == Wt(1)) {
+              for(auto p : pos_terms) {
+                csts.push_back({{p.first.second, y}, exp_ub + p.second});
+	      }
+	    }
+	    // Add bounds for y
+	    lbs.push_back({y, -exp_ub/unbounded_ubcoeff});
           } else {
-            for(auto pl : neg_terms)
-              for(auto pu : pos_terms)
-                csts.push_back(std::make_pair(std::make_pair(pu.first.second, pl.first.second),
-					 exp_ub - pl.second + pu.second));
-            for(auto pl : neg_terms)
-              lbs.push_back(std::make_pair(pl.first.second, -exp_ub/pl.first.first + pl.second));
-            for(auto pu : pos_terms)
-              ubs.push_back(std::make_pair(pu.first.second, exp_ub/pu.first.first + pu.second));
+            for(auto pl : neg_terms) {
+              for(auto pu : pos_terms) {
+                csts.push_back({{pu.first.second, pl.first.second},
+		                exp_ub - pl.second + pu.second});
+	      }
+	    }
+            for(auto pl : neg_terms) {
+              lbs.push_back({pl.first.second, -exp_ub/pl.first.first + pl.second});
+	    }
+            for(auto pu : pos_terms) {
+              ubs.push_back({pu.first.second, exp_ub/pu.first.first + pu.second});
+	    }
           }
         }
-    diffcst_finish:
-        return;
       }
       
 
-      bool add_linear_leq(const linear_expression_t& exp)
-      {
+      bool add_linear_leq(const linear_expression_t& exp) {
         CRAB_LOG("zones-split",
-                 linear_expression_t exp_tmp (exp);
+                 linear_expression_t exp_tmp(exp);
                  crab::outs() << "Adding: "<< exp_tmp << "<= 0" <<"\n");
         std::vector< std::pair<variable_t, Wt> > lbs;
         std::vector< std::pair<variable_t, Wt> > ubs;
@@ -603,8 +546,7 @@ namespace crab {
 
         Wt_min min_op;
         typename graph_t::mut_val_ref_t w;
-        for(auto p : lbs)
-        {
+        for(auto p : lbs) {
           CRAB_LOG("zones-split",
                    crab::outs() << p.first<< ">="<< p.second <<"\n");
           variable_t x(p.first);
@@ -612,31 +554,27 @@ namespace crab {
           if(g.lookup(v, 0, &w) && w.get() <= -p.second)
             continue;
           g.set_edge(v, -p.second, 0);
-          if(!repair_potential(v, 0))
-          {
+          if(!repair_potential(v, 0)) {
             set_to_bottom();
             return false;
           }
           check_potential(g, potential, __LINE__);
           // Compute other updated bounds
 	  if (Params::close_bounds_inline) {
-	    for(auto e : g.e_preds(v))
-	      {
-		if(e.vert == 0)
-		  continue;
-		g.update_edge(e.vert, e.val - p.second, 0, min_op);
-		
-		if(!repair_potential(e.vert, 0))
-		  {
-		    set_to_bottom();
-		    return false;
-		  }
-		check_potential(g, potential, __LINE__);
+	    for(auto e : g.e_preds(v)) {
+	      if(e.vert == 0)
+		continue;
+	      g.update_edge(e.vert, e.val - p.second, 0, min_op);
+	      
+	      if(!repair_potential(e.vert, 0)) {
+		set_to_bottom();
+		return false;
 	      }
+	      check_potential(g, potential, __LINE__);
+	    }
 	  }
         }
-        for(auto p : ubs)
-        {
+        for(auto p : ubs) {
           CRAB_LOG("zones-split",
                    crab::outs() << p.first<< "<="<< p.second <<"\n");
           variable_t x(p.first);
@@ -644,31 +582,27 @@ namespace crab {
           if(g.lookup(0, v, &w) && w.get() <= p.second)
             continue;
           g.set_edge(0, p.second, v);
-          if(!repair_potential(0, v))
-          {
+          if(!repair_potential(0, v)) {
             set_to_bottom();
             return false;
           }
           check_potential(g, potential, __LINE__);
 
 	  if (Params::close_bounds_inline) {	  
-	    for(auto e : g.e_succs(v))
-	      {
-		if(e.vert == 0)
-		  continue;
-		g.update_edge(0, e.val + p.second, e.vert, min_op);
-		if(!repair_potential(0, e.vert))
-		  {
-		    set_to_bottom();
-		    return false;
-		  }
-		check_potential(g, potential, __LINE__);
+	    for(auto e : g.e_succs(v)) {
+	      if(e.vert == 0)
+		continue;
+	      g.update_edge(0, e.val + p.second, e.vert, min_op);
+	      if(!repair_potential(0, e.vert)) {
+		set_to_bottom();
+		return false;
 	      }
+	      check_potential(g, potential, __LINE__);
+	    }
 	  }
         }
       
-        for(auto diff : csts)
-        {
+        for(auto diff : csts) {
           CRAB_LOG("zones-split",
                    crab::outs() << diff.first.first<< "-"<< diff.first.second<< "<="
 		                << diff.second <<"\n");
@@ -676,8 +610,7 @@ namespace crab {
           vert_id src = get_vert(diff.first.second);
           vert_id dest = get_vert(diff.first.first);
           g.update_edge(src, diff.second, dest, min_op);
-          if(!repair_potential(src, dest))
-          {
+          if(!repair_potential(src, dest)) { 
             set_to_bottom();
             return false;
           }
@@ -685,8 +618,8 @@ namespace crab {
           close_over_edge(src, dest);
 	  check_potential(g, potential, __LINE__);
         }
-      // Collect bounds
-      // GKG: Now done in close_over_edge
+	// Collect bounds
+	// GKG: Now done in close_over_edge
 
 	if (!Params::close_bounds_inline) {	  
 	  edge_vector delta;
@@ -791,7 +724,7 @@ namespace crab {
 
         // Found one unfixed variable; collect the rest.
         Wt ucoeff = (*it).first;
-        VariableName uvar((*it).second;
+        varname_t uvar((*it).second;
         interval_t u_int = get_interval(ranges, uvar);
         // We need at least one side of u to be finite.
         if(u_int.lb().is_infinite() && u_int.ub().is_infinite())
@@ -819,8 +752,8 @@ namespace crab {
         }
         vert_id v = (*it).second;
         interval_t x_out = interval_t(
-            r.elem(v, 0) ? -Number(r.edge_val(v, 0)) : bound_t::minus_infinity(),
-            r.elem(0, v) ? Number(r.edge_val(0, v)) : bound_t::plus_infinity());
+            r.elem(v, 0) ? -number_t(r.edge_val(v, 0)) : bound_t::minus_infinity(),
+            r.elem(0, v) ? number_t(r.edge_val(0, v)) : bound_t::plus_infinity());
         return x_out;
         /*
         boost::optional< interval_t > v = r.lookup(x);
@@ -986,18 +919,34 @@ namespace crab {
         CRAB_ERROR("SparseWtGraph::closure not yet implemented."); 
       }
       */
-
-
-      template<typename G>
-      bool is_eq (vert_id u, vert_id v, G& g) {
-        // pre: rev_map[u] and rev_map[v]
-        if (g.elem (u, v) && g.elem (v, u)) {
-          return (g.edge_val(u, v) == g.edge_val(v, u));
+      
+      // return true if edge from x to y with weight k is unsatisfiable
+      bool is_unsat_edge(vert_id x, vert_id y, Wt k){
+	
+        typename graph_t::mut_val_ref_t w;        
+        if (g.lookup(y,x,&w)) {
+          return ((w.get() + k) < 0);
         } else {
-          return false;
+          interval_t intv_x = interval_t::top();
+          interval_t intv_y = interval_t::top();
+          if (g.elem(0,x) || g.elem(x,0)) {
+            intv_x = interval_t(
+                g.elem(x, 0) ? -number_t(g.edge_val(x, 0)) : bound_t::minus_infinity(),
+                g.elem(0, x) ?  number_t(g.edge_val(0, x)) : bound_t::plus_infinity());
+          }
+          if (g.elem(0,y) || g.elem(y,0)) {
+            intv_y = interval_t(
+                g.elem(y, 0) ? -number_t(g.edge_val(y, 0)) : bound_t::minus_infinity(),
+                g.elem(0, y) ?  number_t(g.edge_val(0, y)) : bound_t::plus_infinity());
+          }
+          if (intv_x.is_top() || intv_y.is_top()) {
+            return false;
+          } else  {
+            return (!((intv_y - intv_x).lb() <= k));
+          }
         }
       }
-
+      
       
    public:
       
@@ -1016,7 +965,7 @@ namespace crab {
 	, potential(o.potential)
 	, unstable(o.unstable)
 	, _is_bottom(false) {      
-        crab::CrabStats::count (getDomainName() + ".count.copy");
+        crab::CrabStats::count(getDomainName() + ".count.copy");
         crab::ScopedCrabStats __st__(getDomainName() + ".copy");
 
         if(o._is_bottom)
@@ -1033,7 +982,7 @@ namespace crab {
 	, potential(std::move(o.potential))
 	, unstable(std::move(o.unstable))
         , _is_bottom(o._is_bottom) {
-	crab::CrabStats::count (getDomainName() + ".count.copy");
+	crab::CrabStats::count(getDomainName() + ".count.copy");
         crab::ScopedCrabStats __st__(getDomainName() + ".copy");
       }
 
@@ -1047,7 +996,7 @@ namespace crab {
 	, unstable(_unstable)
 	, _is_bottom(false) {
 	
-	crab::CrabStats::count (getDomainName() + ".count.copy");
+	crab::CrabStats::count(getDomainName() + ".count.copy");
         crab::ScopedCrabStats __st__(getDomainName() + ".copy");
 	
         CRAB_WARN("Non-moving constructor.");
@@ -1063,7 +1012,7 @@ namespace crab {
 	, unstable(std::move(_unstable))
 	, _is_bottom(false) {
 
-	crab::CrabStats::count (getDomainName() + ".count.copy");
+	crab::CrabStats::count(getDomainName() + ".count.copy");
         crab::ScopedCrabStats __st__(getDomainName() + ".copy");
 
 	CRAB_LOG("zones-split-size",
@@ -1075,7 +1024,7 @@ namespace crab {
 
 
       SplitDBM_& operator=(const SplitDBM_& o) {     
-        crab::CrabStats::count (getDomainName() + ".count.copy");
+        crab::CrabStats::count(getDomainName() + ".count.copy");
         crab::ScopedCrabStats __st__(getDomainName() + ".copy");
 
         if(this != &o) {
@@ -1095,7 +1044,7 @@ namespace crab {
       }
 
       SplitDBM_& operator=(SplitDBM_&& o) {
-        crab::CrabStats::count (getDomainName() + ".count.copy");
+        crab::CrabStats::count(getDomainName() + ".count.copy");
         crab::ScopedCrabStats __st__(getDomainName() + ".copy");
       
         if(o._is_bottom) {
@@ -1111,11 +1060,26 @@ namespace crab {
         return *this;
       }
              
-      static DBM_t top() { return SplitDBM_(false); }
+      void set_to_top() {
+	SplitDBM_ abs(false);
+	std::swap(*this, abs);
+      }
+
+      void set_to_bottom() {
+        vert_map.clear();
+        rev_map.clear();
+        g.clear();
+        potential.clear();
+        unstable.clear();
+        _is_bottom = true;
+      }
+      
+      // void set_to_bottom() {
+      // 	SplitDBM_ abs(true);
+      // 	std::swap(*this, abs);	
+      // }
     
-      static DBM_t bottom() { return SplitDBM_(true); }
-    
-      bool is_bottom() const {
+      bool is_bottom() {
         return _is_bottom;
       }
     
@@ -1125,8 +1089,8 @@ namespace crab {
         return g.is_empty();
       }
     
-      bool operator<=(DBM_t& o)  {
-        crab::CrabStats::count (getDomainName() + ".count.leq");
+      bool operator<=(DBM_t o)  {
+        crab::CrabStats::count(getDomainName() + ".count.leq");
         crab::ScopedCrabStats __st__(getDomainName() + ".leq");
 
         // cover all trivial cases to avoid allocating a dbm matrix
@@ -1134,9 +1098,9 @@ namespace crab {
           return true;
         else if(o.is_bottom())
           return false;
-        else if (o.is_top ())
+        else if (o.is_top())
           return true;
-        else if (is_top ())
+        else if (is_top())
           return false;
         else {
           normalize();
@@ -1201,16 +1165,16 @@ namespace crab {
         *this = *this | o;
       }
 
-      DBM_t operator|(DBM_t& o) {
-        crab::CrabStats::count (getDomainName() + ".count.join");
+      DBM_t operator|(DBM_t o) {
+        crab::CrabStats::count(getDomainName() + ".count.join");
         crab::ScopedCrabStats __st__(getDomainName() + ".join");
 
-        if (is_bottom() || o.is_top ())
+        if (is_bottom() || o.is_top())
           return o;
-        else if (is_top () || o.is_bottom())
+        else if (is_top() || o.is_bottom())
           return *this;
         else {
-          CRAB_LOG ("zones-split",
+          CRAB_LOG("zones-split",
                     crab::outs() << "Before join:\n"<<"DBM 1\n"<<*this<<"\n"<<"DBM 2\n"
 		                 << o <<"\n");
 
@@ -1401,15 +1365,15 @@ namespace crab {
           DBM_t res(std::move(out_vmap), std::move(out_revmap), std::move(join_g), 
                     std::move(pot_rx), vert_set_t());
           //join_g.check_adjs();
-          CRAB_LOG ("zones-split",
+          CRAB_LOG("zones-split",
                     crab::outs() << "Result join:\n"<<res <<"\n");
            
           return res;
         }
       }
 
-      DBM_t operator||(DBM_t& o) {	
-        crab::CrabStats::count (getDomainName() + ".count.widening");
+      DBM_t operator||(DBM_t o) {	
+        crab::CrabStats::count(getDomainName() + ".count.widening");
         crab::ScopedCrabStats __st__(getDomainName() + ".widening");
 
         if (is_bottom())
@@ -1417,7 +1381,7 @@ namespace crab {
         else if (o.is_bottom())
           return *this;
         else {
-          CRAB_LOG ("zones-split",
+          CRAB_LOG("zones-split",
                     crab::outs() << "Before widening:\n"<<"DBM 1\n"<<*this<<"\n"<<"DBM 2\n"
 		    <<o <<"\n");
           o.normalize();
@@ -1465,30 +1429,29 @@ namespace crab {
           DBM_t res(std::move(out_vmap), std::move(out_revmap), std::move(widen_g), 
                     std::move(widen_pot), std::move(widen_unstable));
            
-          CRAB_LOG ("zones-split",
+          CRAB_LOG("zones-split",
                     crab::outs() << "Result widening:\n"<<res <<"\n");
           return res;
         }
       }
 
-      template<typename Thresholds>
-      DBM_t widening_thresholds (DBM_t& o, const Thresholds &ts) {
+      DBM_t widening_thresholds(DBM_t o, const iterators::thresholds<number_t>& ts) {
         // TODO: use thresholds
         return (*this || o);
       }
 
-      DBM_t operator&(DBM_t& o) {
-        crab::CrabStats::count (getDomainName() + ".count.meet");
+      DBM_t operator&(DBM_t o) {
+        crab::CrabStats::count(getDomainName() + ".count.meet");
         crab::ScopedCrabStats __st__(getDomainName() + ".meet");
 
         if (is_bottom() || o.is_bottom())
-          return bottom();
+          return DBM_t::bottom();
         else if (is_top())
           return o;
         else if (o.is_top())
           return *this;
         else{
-          CRAB_LOG ("zones-split",
+          CRAB_LOG("zones-split",
                     crab::outs() << "Before meet:\n"<<"DBM 1\n"<<*this<<"\n"<<"DBM 2\n"<<o
 		                 <<"\n");
           normalize();
@@ -1555,7 +1518,7 @@ namespace crab {
           if(!GrOps::select_potentials(meet_g, meet_pi))
           {
             // Potentials cannot be selected -- state is infeasible.
-            return bottom();
+            return DBM_t::bottom();
           }
 
           if(!is_closed)
@@ -1592,22 +1555,22 @@ namespace crab {
           check_potential(meet_g, meet_pi, __LINE__); 
           DBM_t res(std::move(meet_verts), std::move(meet_rev), std::move(meet_g), 
                     std::move(meet_pi), vert_set_t());
-          CRAB_LOG ("zones-split",
+          CRAB_LOG("zones-split",
                     crab::outs() << "Result meet:\n"<<res <<"\n");
           return res;
         }
       }
     
-      DBM_t operator&&(DBM_t& o) {
-        crab::CrabStats::count (getDomainName() + ".count.narrowing");
+      DBM_t operator&&(DBM_t o) {
+        crab::CrabStats::count(getDomainName() + ".count.narrowing");
         crab::ScopedCrabStats __st__(getDomainName() + ".narrowing");
 
         if (is_bottom() || o.is_bottom())
-          return bottom();
-        else if (is_top ())
+          return DBM_t::bottom();
+        else if (is_top())
           return o;
         else{
-          CRAB_LOG ("zones-split",
+          CRAB_LOG("zones-split",
                     crab::outs() << "Before narrowing:\n"<<"DBM 1\n"<<*this<<"\n"<<"DBM 2\n"
 		                 << o <<"\n");
 
@@ -1616,14 +1579,14 @@ namespace crab {
           normalize();
           DBM_t res(*this);
 
-          CRAB_LOG ("zones-split",
+          CRAB_LOG("zones-split",
                     crab::outs() << "Result narrowing:\n"<<res <<"\n");
           return res;
         }
       }	
 
       void normalize() {
-        crab::CrabStats::count (getDomainName() + ".count.normalize");
+        crab::CrabStats::count(getDomainName() + ".count.normalize");
         crab::ScopedCrabStats __st__(getDomainName() + ".normalize");
 	
         // dbm_canonical(_dbm);
@@ -1651,15 +1614,15 @@ namespace crab {
       }
 
       void operator-=(variable_t v) {
-        crab::CrabStats::count (getDomainName() + ".count.forget");
+        crab::CrabStats::count(getDomainName() + ".count.forget");
         crab::ScopedCrabStats __st__(getDomainName() + ".forget");
 	
-        if (is_bottom ())
+        if (is_bottom())
           return;
         normalize();
 
-        auto it = vert_map.find (v);
-        if (it != vert_map.end ()) {
+        auto it = vert_map.find(v);
+        if (it != vert_map.end()) {
           CRAB_LOG("zones-split", crab::outs() << "Before forget "<< it->second<< ": "
 		                               << g <<"\n");
           g.forget(it->second);
@@ -1669,20 +1632,8 @@ namespace crab {
         }
       }
 
-      template<typename Iterator>
-      void forget (Iterator vIt, Iterator vEt) {
-        if (is_bottom ())
-          return;
-        for (auto v: boost::make_iterator_range (vIt,vEt)) {
-          auto it = vert_map.find (v);
-          if (it != vert_map.end ()) {
-            operator-=(v);
-          }
-        }
-      }
-
       void assign(variable_t x, linear_expression_t e) {
-        crab::CrabStats::count (getDomainName() + ".count.assign");
+        crab::CrabStats::count(getDomainName() + ".count.assign");
         crab::ScopedCrabStats __st__(getDomainName() + ".assign");
 
         if(is_bottom()) {
@@ -1818,132 +1769,108 @@ namespace crab {
       }
 
       void apply(operation_t op, variable_t x, variable_t y, variable_t z){	
-        crab::CrabStats::count (getDomainName() + ".count.apply");
+        crab::CrabStats::count(getDomainName() + ".count.apply");
         crab::ScopedCrabStats __st__(getDomainName() + ".apply");
 
-        if(is_bottom())
+        if(is_bottom()) {
           return;
+	}
 
         normalize();
 
-        switch(op)
-        {
+        switch(op) {
           case OP_ADDITION:
-          {
             assign(x, y + z);
             break;
-          }
           case OP_SUBTRACTION:
-          {
             assign(x, y - z);
             break;
-          }
-          // For mul and div, we fall back on intervals.
+          // For the rest of operations, we fall back on intervals.
           case OP_MULTIPLICATION:
-          {
             set(x, get_interval(y)*get_interval(z));
             break;
-          }
-          case OP_DIVISION:
-          {
-            interval_t xi(get_interval(y)/get_interval(z));
-            if(xi.is_bottom())
-              set_to_bottom();
-            else
-              set(x, xi);
+          case OP_SDIV:
+            set(x, get_interval(y)/get_interval(z));
             break;
-          }
+          case OP_UDIV:
+            set(x, get_interval(y).UDiv(get_interval(z)));
+            break;
+          case OP_SREM:
+            set(x, get_interval(y).SRem(get_interval(z)));
+            break;
+          case OP_UREM:
+            set(x, get_interval(y).URem(get_interval(z)));
+            break;
+	  default:
+	    CRAB_ERROR("Operation ", op, " not supported");
         }
-        /*
-        if (x == y){
-          // --- ensure lhs does not appear on the rhs
-          assign_tmp(y); 
-          apply(op, x, get_tmp(), get_dbm_index(z));
-          forget(get_tmp());
-        }
-        else if (x == z){
-          // --- ensure lhs does not appear on the rhs
-          assign_tmp(z); 
-          apply(op, x, get_dbm_index (y), get_tmp());
-          forget(get_tmp());
-        }
-        else{
-          if (x == y && y == z)
-            CRAB_ERROR("DBM: does not support x := x + x ");
-          else
-            apply(op, x, get_dbm_index(y), get_dbm_index(z));
-        }
-      */
+	
         CRAB_LOG("zones-split",
                  crab::outs() << "---"<< x<< ":="<< y<< op<< z<<"\n"<< *this <<"\n");
       }
 
     
-      void apply(operation_t op, variable_t x, variable_t y, Number k) {	
-        crab::CrabStats::count (getDomainName() + ".count.apply");
+      void apply(operation_t op, variable_t x, variable_t y, number_t k) {	
+        crab::CrabStats::count(getDomainName() + ".count.apply");
         crab::ScopedCrabStats __st__(getDomainName() + ".apply");
 
-        if(is_bottom())
+        if(is_bottom()) {
           return;
+	}
 
         normalize();
 
-        switch(op)
-        {
+        switch(op) {
           case OP_ADDITION:
-          {
             assign(x, y + k);
             break;
-          }
           case OP_SUBTRACTION:
-          {
             assign(x, y - k);
             break;
-          }
-          // For mul and div, we fall back on intervals.
+          // For the rest of operations, we fall back on intervals.
           case OP_MULTIPLICATION:
-          {
-            set(x, get_interval(y)*k);
-
+            set(x, get_interval(y)*interval_t(k));
             break;
-          }
-          case OP_DIVISION:
-          {
-            if(k == Wt(0))
-              set_to_bottom();
-            else
-              set(x, get_interval(y)/k);
-
+          case OP_SDIV:
+            set(x, get_interval(y)/interval_t(k));
             break;
-          }
+          case OP_UDIV:
+            set(x, get_interval(y).UDiv(interval_t(k)));
+            break;
+          case OP_SREM:
+            set(x, get_interval(y).SRem(interval_t(k)));
+            break;
+          case OP_UREM:
+            set(x, get_interval(y).URem(interval_t(k)));
+            break;
+	  default:
+	    CRAB_ERROR("Operation ", op, " not supported");
         }
 
         CRAB_LOG("zones-split",
                  crab::outs() << "---"<< x<< ":="<< y<< op<< k<<"\n"<< *this <<"\n");
       }
       
-      void backward_assign (variable_t x, linear_expression_t e,
-			    DBM_t inv) { 
+      void backward_assign(variable_t x, linear_expression_t e,
+			   DBM_t inv) { 
 	crab::domains::BackwardAssignOps<DBM_t>::
-	  assign (*this, x, e, inv);
+	  assign(*this, x, e, inv);
       }
       
-      void backward_apply (operation_t op,
-			   variable_t x, variable_t y, Number z,
-			   DBM_t inv) {
+      void backward_apply(operation_t op, variable_t x, variable_t y, number_t z,
+			  DBM_t inv) {
 	crab::domains::BackwardAssignOps<DBM_t>::
 	  apply(*this, op, x, y, z, inv);
       }
       
-      void backward_apply(operation_t op,
-			  variable_t x, variable_t y, variable_t z,
+      void backward_apply(operation_t op, variable_t x, variable_t y, variable_t z,
 			  DBM_t inv) {
 	crab::domains::BackwardAssignOps<DBM_t>::
 	  apply(*this, op, x, y, z, inv);
       }
       
       void operator+=(linear_constraint_t cst) {
-        crab::CrabStats::count (getDomainName() + ".count.add_constraints");
+        crab::CrabStats::count(getDomainName() + ".count.add_constraints");
         crab::ScopedCrabStats __st__(getDomainName() + ".add_constraints");
 
 	// XXX: we do nothing with unsigned linear inequalities
@@ -2022,7 +1949,7 @@ namespace crab {
       }
 
       interval_t operator[](variable_t x) { 
-        crab::CrabStats::count (getDomainName() + ".count.to_intervals");
+        crab::CrabStats::count(getDomainName() + ".count.to_intervals");
         crab::ScopedCrabStats __st__(getDomainName() + ".to_intervals");
 
         // if (is_top())    return interval_t::top();
@@ -2035,16 +1962,22 @@ namespace crab {
       }
 
       void set(variable_t x, interval_t intv) {
-        crab::CrabStats::count (getDomainName() + ".count.assign");
+        crab::CrabStats::count(getDomainName() + ".count.assign");
         crab::ScopedCrabStats __st__(getDomainName() + ".assign");
 
         if(is_bottom())
           return;
 
+	if (intv.is_bottom()) {
+	  set_to_bottom();
+	  return;
+	}
+	
         this->operator-=(x);
 
-        if(intv.is_top())
+        if(intv.is_top()) {
           return;
+	}
 
         vert_id v = get_vert(x);
         if(intv.ub().is_finite())
@@ -2071,7 +2004,7 @@ namespace crab {
 
       // bitwise_operators_api      
       void apply(bitwise_operation_t op, variable_t x, variable_t y, variable_t z) {
-        crab::CrabStats::count (getDomainName() + ".count.apply");
+        crab::CrabStats::count(getDomainName() + ".count.apply");
         crab::ScopedCrabStats __st__(getDomainName() + ".apply");
 
         // Convert to intervals and perform the operation
@@ -2112,8 +2045,8 @@ namespace crab {
         set(x, xi);
       }
     
-      void apply(bitwise_operation_t op, variable_t x, variable_t y, Number k) {
-        crab::CrabStats::count (getDomainName() + ".count.apply");
+      void apply(bitwise_operation_t op, variable_t x, variable_t y, number_t k) {
+        crab::CrabStats::count(getDomainName() + ".count.apply");
         crab::ScopedCrabStats __st__(getDomainName() + ".apply");
 
         // Convert to intervals and perform the operation
@@ -2152,85 +2085,99 @@ namespace crab {
         }
         set(x, xi);
       }
-    
-      // division_operators_api
-    
-      void apply(div_operation_t op, variable_t x, variable_t y, variable_t z) {
-        crab::CrabStats::count (getDomainName() + ".count.apply");
-        crab::ScopedCrabStats __st__(getDomainName() + ".apply");
 
-        if (op == OP_SDIV){
-          apply(OP_DIVISION, x, y, z);
-        }
-        else{
-          normalize();
-          // Convert to intervals and perform the operation
-          interval_t yi = operator[](y);
-          interval_t zi = operator[](z);
-          interval_t xi = interval_t::bottom();
-      
-          switch (op) {
-            case OP_UDIV: {
-              xi = yi.UDiv(zi);
-              break;
-            }
-            case OP_SREM: {
-              xi = yi.SRem(zi);
-              break;
-            }
-            case OP_UREM: {
-              xi = yi.URem(zi);
-              break;
-            }
-            default: 
-              CRAB_ERROR("spDBM: unreachable");
-          }
-          set(x, xi);
-        }
-      }
+      /* Begin unimplemented operations */
+      // boolean operations
+      void assign_bool_cst(variable_t lhs, linear_constraint_t rhs) {}
+      void assign_bool_var(variable_t lhs, variable_t rhs, bool is_not_rhs) {}
+      void apply_binary_bool(bool_operation_t op, variable_t x,variable_t y,variable_t z) {}
+      void assume_bool(variable_t v, bool is_negated) {}
+      // backward boolean operations
+      void backward_assign_bool_cst(variable_t lhs, linear_constraint_t rhs,
+				    DBM_t invariant){}
+      void backward_assign_bool_var(variable_t lhs, variable_t rhs, bool is_not_rhs,
+				      DBM_t invariant) {}
+      void backward_apply_binary_bool(bool_operation_t op,
+				      variable_t x,variable_t y,variable_t z,
+				      DBM_t invariant) {}
+      // array operations
+      void array_init(variable_t a, linear_expression_t elem_size,
+		      linear_expression_t lb_idx, linear_expression_t ub_idx, 
+		      linear_expression_t val) {}      
+      void array_load(variable_t lhs,
+		      variable_t a, linear_expression_t elem_size,
+		      linear_expression_t i) {}
+      void array_store(variable_t a, linear_expression_t elem_size,
+		       linear_expression_t i, linear_expression_t v, 
+		       bool is_singleton) {}
+      void array_store_range(variable_t a, linear_expression_t elem_size,
+			     linear_expression_t i, linear_expression_t j,
+			     linear_expression_t v) {}                  
+      void array_assign(variable_t lhs, variable_t rhs) {}
+      // pointer operations
+      void pointer_load(variable_t lhs, variable_t rhs)  {}
+      void pointer_store(variable_t lhs, variable_t rhs) {} 
+      void pointer_assign(variable_t lhs, variable_t rhs, linear_expression_t offset) {}
+      void pointer_mk_obj(variable_t lhs, ikos::index_t address) {}
+      void pointer_function(variable_t lhs, varname_t func) {}
+      void pointer_mk_null(variable_t lhs) {}
+      void pointer_assume(pointer_constraint_t cst) {}
+      void pointer_assert(pointer_constraint_t cst) {}
+      /* End unimplemented operations */
 
-      void apply(div_operation_t op, variable_t x, variable_t y, Number k) {
-        crab::CrabStats::count (getDomainName() + ".count.apply");
-        crab::ScopedCrabStats __st__(getDomainName() + ".apply");
+      void project(const variable_vector_t& variables) {
+        crab::CrabStats::count(getDomainName() + ".count.project");
+        crab::ScopedCrabStats __st__(getDomainName() + ".project");
 
-        if (op == OP_SDIV){
-          apply(OP_DIVISION, x, y, k);
+        if (is_bottom() || is_top()) {
+          return;
+	}
+        if (variables.empty()) {
+          return;
+	}
+
+        normalize();
+
+        std::vector<bool> save(rev_map.size(), false);
+        for(auto x : variables) {
+          auto it = vert_map.find(x);
+          if(it != vert_map.end())
+            save[(*it).second] = true;
         }
-        else{
-          // Convert to intervals and perform the operation
-          interval_t yi = operator[](y);
-          interval_t zi(k);
-          interval_t xi = interval_t::bottom();
-      
-          switch (op) {
-            case OP_UDIV: {
-              xi = yi.UDiv(zi);
-              break;
-            }
-            case OP_SREM: {
-              xi = yi.SRem(zi);
-              break;
-            }
-            case OP_UREM: {
-              xi = yi.URem(zi);
-              break;
-            }
-            default: 
-              CRAB_ERROR("DBM: unreachable");
-          }
-          set(x, xi);
+
+        for(vert_id v = 0; v < rev_map.size(); v++) {
+          if(!save[v] && rev_map[v]) {
+            operator-=((*rev_map[v]));
+	  }
         }
       }
 
-      //! copy of x into a new fresh variable y
-      void expand (variable_t x, variable_t y) {
-        crab::CrabStats::count (getDomainName() + ".count.expand");
+      
+      void forget(const variable_vector_t& variables) {
+        crab::CrabStats::count(getDomainName() + ".count.forget");
+        crab::ScopedCrabStats __st__(getDomainName() + ".forget");
+	
+        if (is_bottom() || is_top()) {
+          return;
+	}
+	
+        for (auto v: variables) {
+          auto it = vert_map.find(v);
+          if (it != vert_map.end()) {
+            operator-=(v);
+          }
+        }
+      }
+      
+      void expand(variable_t x, variable_t y) {
+        crab::CrabStats::count(getDomainName() + ".count.expand");
         crab::ScopedCrabStats __st__(getDomainName() + ".expand");
 
-        if(is_bottom()) 
+        if(is_bottom() || is_top()) {
           return;
+	}
         
-        CRAB_LOG ("zones-split",
+        CRAB_LOG("zones-split",
                   crab::outs() << "Before expand " << x << " into " << y << ":\n"
 		               << *this <<"\n");
 
@@ -2242,52 +2189,26 @@ namespace crab {
         vert_id ii = get_vert(x);
         vert_id jj = get_vert(y);
 
-        for (auto edge : g.e_preds(ii))  
-          g.add_edge (edge.vert, edge.val, jj);
+        for (auto edge : g.e_preds(ii)) {   
+          g.add_edge(edge.vert, edge.val, jj);
+	}
         
-        for (auto edge : g.e_succs(ii))  
-          g.add_edge (jj, edge.val, edge.vert);
+        for (auto edge : g.e_succs(ii)) {  
+          g.add_edge(jj, edge.val, edge.vert);
+	}
 
 	potential[jj] = potential[ii];
 	
-        CRAB_LOG ("zones-split",
+        CRAB_LOG("zones-split",
                   crab::outs() << "After expand " << x << " into " << y << ":\n"
 		               << *this <<"\n");
       }
 
-      // dual of forget: remove all variables except [vIt,...vEt)
-      template<typename Iterator>
-      void project (Iterator vIt, Iterator vEt) {
-        crab::CrabStats::count (getDomainName() + ".count.project");
-        crab::ScopedCrabStats __st__(getDomainName() + ".project");
-
-        if (is_bottom ())
-          return;
-        if (vIt == vEt) 
-          return;
-
-        normalize();
-
-        std::vector<bool> save(rev_map.size(), false);
-        for(auto x : boost::make_iterator_range(vIt, vEt))
-        {
-          auto it = vert_map.find(x);
-          if(it != vert_map.end())
-            save[(*it).second] = true;
-        }
-
-        for(vert_id v = 0; v < rev_map.size(); v++)
-	{
-          if(!save[v] && rev_map[v])
-            operator-=((*rev_map[v]));
-        }
-      }
-
       void rename(const variable_vector_t &from, const variable_vector_t &to) {
-        crab::CrabStats::count (getDomainName() + ".count.rename");
+        crab::CrabStats::count(getDomainName() + ".count.rename");
         crab::ScopedCrabStats __st__(getDomainName() + ".rename");
 	
-	if (is_top () || is_bottom()) return;
+	if (is_top() || is_bottom()) return;
 	
 	// renaming vert_map by creating a new vert_map since we are
 	// modifying the keys.
@@ -2315,16 +2236,16 @@ namespace crab {
 	std::swap(vert_map, new_vert_map);
 
 	CRAB_LOG("zones-split",
-		 crab::outs () << "RESULT=" << *this << "\n");
+		 crab::outs() << "RESULT=" << *this << "\n");
       }
             
       void extract(const variable_t& x, linear_constraint_system_t& csts,
 		   bool only_equalities){
-        crab::CrabStats::count (getDomainName() + ".count.extract");
+        crab::CrabStats::count(getDomainName() + ".count.extract");
         crab::ScopedCrabStats __st__(getDomainName() + ".extract");
 
-        normalize ();
-        if (is_bottom ()) {
+        normalize();
+        if (is_bottom()) {
 	  return;
 	}
 
@@ -2339,18 +2260,18 @@ namespace crab {
                 variable_t vd = *rev_map[d];
                 // We give priority to equalities since some domains
                 // might not understand inequalities
-                if (g_excl.elem (s, d) && g_excl.elem (d, s) &&
+                if (g_excl.elem(s, d) && g_excl.elem(d, s) &&
                     g_excl.edge_val(s, d) == 0 &&
 		    g_excl.edge_val(d, s) == 0) {
-                  linear_constraint_t cst (linear_expression_t(vs) == vd);
+                  linear_constraint_t cst(linear_expression_t(vs) == vd);
                   csts += cst;
                 } else {
-		  if (!only_equalities && g_excl.elem (s, d)) {
-		    linear_constraint_t cst (vd - vs <= g_excl.edge_val(s, d));
+		  if (!only_equalities && g_excl.elem(s, d)) {
+		    linear_constraint_t cst(vd - vs <= g_excl.edge_val(s, d));
 		    csts += cst;
 		  }
-		  if (!only_equalities && g_excl.elem (d, s)) {
-		    linear_constraint_t cst (vs - vd <= g_excl.edge_val(d, s));
+		  if (!only_equalities && g_excl.elem(d, s)) {
+		    linear_constraint_t cst(vs - vd <= g_excl.edge_val(d, s));
 		    csts += cst;
 		  }
 		}
@@ -2360,68 +2281,80 @@ namespace crab {
         }
       }
 
-      // -- begin array_sgraph_domain_traits
-
-      // return true iff inequality cst is unsatisfiable.
+      // -- begin array_sgraph_domain_helper_traits
+	
+      // return true iff cst is unsatisfiable without modifying the DBM
       bool is_unsat(linear_constraint_t cst) {
-        if (is_bottom() || cst.is_contradiction()) 
+        if (is_bottom() || cst.is_contradiction()) {
           return true;
+      	}
 
-        if (is_top() || cst.is_tautology()) 
+        if (is_top() || cst.is_tautology()) {
           return false;
+      	}
 
-        if (!cst.is_inequality()) {
-          CRAB_WARN("is_unsat only supports inequalities");
-          /// XXX: but it would be trivial to handle equalities
-          return false;
-        }
-                  
-        auto diffcst = diffcst_of_leq(cst);
-        if (!diffcst)
-          return false;
+        std::vector<std::pair<variable_t, Wt>> lbs, ubs;
+        std::vector<diffcst_t> diffcsts;
+	
+      	if (cst.is_inequality()) {
+      	  linear_expression_t exp = cst.expression();
+      	  diffcsts_of_lin_leq(exp, diffcsts, lbs, ubs);
+      	} else if (cst.is_strict_inequality()) {
+      	  auto nc = linear_constraint_impl::strict_to_non_strict_inequality(cst);
+      	  if (nc.is_inequality()) {
+      	    linear_expression_t exp = nc.expression();
+      	    diffcsts_of_lin_leq(exp, diffcsts, lbs, ubs);	    
+      	  } else {
+      	    // we couldn't convert the strict into a non-strict 
+      	    return false;
+      	  }
+      	} else if (cst.is_equality()) {
+	  linear_expression_t exp = cst.expression();
+	  diffcsts_of_lin_leq(exp, diffcsts, lbs, ubs);
+	  diffcsts_of_lin_leq(-exp, diffcsts, lbs, ubs);
+      	} else {
+      	  return false;
+      	}
 
-        // x - y <= k
-        auto x = (*diffcst).first;
-        auto y = (*diffcst).second.first;
-        auto k = (*diffcst).second.second;
+      	// check difference constraints
+      	for (auto diffcst: diffcsts) {
+	  variable_t x = diffcst.first.first;
+	  variable_t y = diffcst.first.second;
+	  Wt k = diffcst.second;
+      	  if (is_unsat_edge(get_vert(y), get_vert(x), k)) {
+      	    return true;
+      	  }
+      	}
+	
+      	// check interval constraints
+      	for (auto ub: ubs) {
+      	  if (is_unsat_edge(0, get_vert(ub.first), ub.second)) {
+      	    return true;
+      	  }
+      	}
+      	for (auto lb: lbs) {
+      	  if (is_unsat_edge(get_vert(lb.first), 0, -lb.second)) {
+      	    return true;
+      	  }
+      	}
 
-        typename graph_t::mut_val_ref_t w;        
-        if (g.lookup(y,x,&w)) {
-          return ((w.get() + k) < 0);
-        } else {
-          interval_t intv_x = interval_t::top();
-          interval_t intv_y = interval_t::top();
-          if (g.elem(0,x) || g.elem(x,0)) {
-            intv_x = interval_t(
-                g.elem(x, 0) ? -Number(g.edge_val(x, 0)) : bound_t::minus_infinity(),
-                g.elem(0, x) ?  Number(g.edge_val(0, x)) : bound_t::plus_infinity());
-          }
-          if (g.elem(0,y) || g.elem(y,0)) {
-            intv_y = interval_t(
-                g.elem(y, 0) ? -Number(g.edge_val(y, 0)) : bound_t::minus_infinity(),
-                g.elem(0, y) ?  Number(g.edge_val(0, y)) : bound_t::plus_infinity());
-          }
-          if (intv_x.is_top() || intv_y.is_top()) {
-            return false;
-          } else  {
-            return (!((intv_y - intv_x).lb() <= k));
-          }
-        }
+      	return false;
       }
 
       void active_variables(std::vector<variable_t>& out) const {
         out.reserve(g.size());
         for (auto v: g.verts()) {
-          if (rev_map[v]) 
+          if (rev_map[v]) {
             out.push_back((*(rev_map[v])));
+	  }
         }
       }
-      // -- end array_sgraph_domain_traits
+      // -- end array_sgraph_domain_helper_traits
       
       // Output function
       void write(crab_os& o) {
 
-        normalize ();
+        normalize();
         #if 0
         o << "edges={";
         for(vert_id v : g.verts())
@@ -2468,8 +2401,8 @@ namespace crab {
             if(!g.elem(0, v) && !g.elem(v, 0))
              continue; 
             interval_t v_out = interval_t(
-                g.elem(v, 0) ? -Number(g.edge_val(v, 0)) : bound_t::minus_infinity(),
-                g.elem(0, v) ? Number(g.edge_val(0, v)) : bound_t::plus_infinity());
+                g.elem(v, 0) ? -number_t(g.edge_val(v, 0)) : bound_t::minus_infinity(),
+                g.elem(0, v) ? number_t(g.edge_val(0, v)) : bound_t::plus_infinity());
 
             if(first)
               first = false;
@@ -2498,20 +2431,20 @@ namespace crab {
           }
           o << "}";
 
-	  // linear_constraint_system_t inv = to_linear_constraint_system ();
+	  // linear_constraint_system_t inv = to_linear_constraint_system();
 	  // o << inv;
         }
       }
 
-      linear_constraint_system_t to_linear_constraint_system () {
-        crab::CrabStats::count (getDomainName() + ".count.to_linear_constraints");
+      linear_constraint_system_t to_linear_constraint_system() {
+        crab::CrabStats::count(getDomainName() + ".count.to_linear_constraints");
         crab::ScopedCrabStats __st__(getDomainName() + ".to_linear_constraints");
 
-        normalize ();
+        normalize();
 
         linear_constraint_system_t csts;
     
-        if(is_bottom ()) {
+        if(is_bottom()) {
           csts += linear_constraint_t::get_false();
           return csts;
         }
@@ -2562,26 +2495,31 @@ namespace crab {
 	return {g.size(), g.num_edges()};
       }
       
-      static std::string getDomainName () {
+      static std::string getDomainName() {
         return "SplitDBM";
       }
 
     }; // class SplitDBM_
-
+    
     #if 1
     template<class Number, class VariableName,
 	     class Params = SDBM_impl::DefaultParams<Number>>
-    using SplitDBM = SplitDBM_<Number,VariableName,Params>;     
+    using SplitDBM = SplitDBM_<Number,VariableName,Params>;    
     #else
+
+    template<typename Number, typename VariableName, typename SplitDBMParams>    
+    struct abstract_domain_traits<SplitDBM_<Number, VariableName, SplitDBMParams>> {
+      typedef Number number_t;
+      typedef VariableName varname_t;       
+    };    
+    
     // Quick wrapper which uses shared references with copy-on-write.
     template<class Number, class VariableName,
 	     class Params=SDBM_impl::DefaultParams<Number>>
-    class SplitDBM:
-      public abstract_domain<Number, VariableName,
-			     SplitDBM<Number,VariableName,Params>> {
-
+    class SplitDBM final:
+      public abstract_domain<SplitDBM<Number,VariableName,Params>> {
       typedef SplitDBM<Number, VariableName, Params> DBM_t;
-      typedef abstract_domain<Number,VariableName,DBM_t> abstract_domain_t;
+      typedef abstract_domain<DBM_t> abstract_domain_t;
       
     public:
       
@@ -2590,15 +2528,16 @@ namespace crab {
       using typename abstract_domain_t::linear_constraint_system_t;
       using typename abstract_domain_t::disjunctive_linear_constraint_system_t;      
       using typename abstract_domain_t::variable_t;
-      using typename abstract_domain_t::number_t;
-      using typename abstract_domain_t::varname_t;
-      using typename abstract_domain_t::variable_vector_t;      
+      using typename abstract_domain_t::variable_vector_t;
+      using typename abstract_domain_t::pointer_constraint_t;
+      typedef Number number_t;
+      typedef VariableName varname_t;
       typedef typename linear_constraint_t::kind_t constraint_kind_t;
-      typedef interval<Number>  interval_t;
+      typedef interval<number_t>  interval_t;
 
     public:
       
-      typedef SplitDBM_<Number, VariableName, Params> dbm_impl_t;
+      typedef SplitDBM_<number_t, varname_t, Params> dbm_impl_t;
       typedef std::shared_ptr<dbm_impl_t> dbm_ref_t;
 
       SplitDBM(dbm_ref_t _ref)
@@ -2627,9 +2566,15 @@ namespace crab {
 
     public:
 
-      static DBM_t top() { return SplitDBM(false); }
+      void set_to_top() {
+	SplitDBM abs(false);
+	std::swap(*this, abs);
+      }
     
-      static DBM_t bottom() { return SplitDBM(true); }
+      void set_to_bottom() {
+	SplitDBM abs(true);
+	std::swap(*this, abs);
+      }
 
       SplitDBM(bool is_bottom = false)
         : norm_ref(std::make_shared<dbm_impl_t>(is_bottom)) { }
@@ -2663,9 +2608,8 @@ namespace crab {
       DBM_t operator&(DBM_t o) { return create(norm() & o.norm()); }
       DBM_t operator&&(DBM_t o) { return create(norm() && o.norm()); }
 
-      template<typename Thresholds>
-      DBM_t widening_thresholds (DBM_t o, const Thresholds &ts) {
-        return create_base(base().template widening_thresholds<Thresholds>(o.norm(), ts));
+      DBM_t widening_thresholds(DBM_t o, const iterators::thresholds<number_t>& ts) {
+        return create_base(base().widening_thresholds(o.norm(), ts));
       }
 
       void normalize() { lock(); norm().normalize(); }
@@ -2674,16 +2618,18 @@ namespace crab {
       interval_t operator[](variable_t x) { return norm()[x]; }
       void set(variable_t x, interval_t intv) { lock(); norm().set(x, intv); }
 
-      template<typename Iterator>
-      void forget (Iterator vIt, Iterator vEt) { lock(); norm().forget(vIt, vEt); }
       void assign(variable_t x, linear_expression_t e) { lock(); norm().assign(x, e); }
-      void apply(operation_t op, variable_t x, variable_t y, Number k) {
+      void apply(operation_t op, variable_t x, variable_t y, number_t k) {
         lock(); norm().apply(op, x, y, k);
+      }
+      void apply(operation_t op, variable_t x, variable_t y, variable_t z) {
+        lock(); norm().apply(op, x, y, z);
       }
       void backward_assign(variable_t x, linear_expression_t e, DBM_t invariant) {
 	lock(); norm().backward_assign(x, e, invariant.norm());
       }
-      void backward_apply(operation_t op, variable_t x, variable_t y, Number k, DBM_t invariant) {
+      void backward_apply(operation_t op, variable_t x, variable_t y, number_t k,
+			  DBM_t invariant) {
 	lock(); norm().backward_apply(op, x, y, k, invariant.norm());
       }
       void backward_apply(operation_t op, variable_t x, variable_t y, variable_t z,
@@ -2693,85 +2639,98 @@ namespace crab {
       void apply(int_conv_operation_t op, variable_t dst, variable_t src) {
         lock(); norm().apply(op, dst, src);
       }
-      void apply(bitwise_operation_t op, variable_t x, variable_t y, Number k) {
+      void apply(bitwise_operation_t op, variable_t x, variable_t y, number_t k) {
         lock(); norm().apply(op, x, y, k);
       }
       void apply(bitwise_operation_t op, variable_t x, variable_t y, variable_t z) {
         lock(); norm().apply(op, x, y, z);
       }
-      void apply(operation_t op, variable_t x, variable_t y, variable_t z) {
-        lock(); norm().apply(op, x, y, z);
-      }
-      void apply(div_operation_t op, variable_t x, variable_t y, variable_t z) {
-        lock(); norm().apply(op, x, y, z);
-      }
-      void apply(div_operation_t op, variable_t x, variable_t y, Number k) {
-        lock(); norm().apply(op, x, y, k);
-      }
-      void expand (variable_t x, variable_t y) { lock(); norm().expand(x, y); }
-
-      template<typename Iterator>
-      void project (Iterator vIt, Iterator vEt) { lock(); norm().project(vIt, vEt); }
-
-      void rename(const variable_vector_t &from, const variable_vector_t &to)
-      { lock(); norm().rename(from, to); }
       
+      /* Begin unimplemented operations */
+      // boolean operations
+      void assign_bool_cst(variable_t lhs, linear_constraint_t rhs) {}
+      void assign_bool_var(variable_t lhs, variable_t rhs, bool is_not_rhs) {}
+      void apply_binary_bool(bool_operation_t op, variable_t x,variable_t y,variable_t z) {}
+      void assume_bool(variable_t v, bool is_negated) {}
+      // backward boolean operations
+      void backward_assign_bool_cst(variable_t lhs, linear_constraint_t rhs,
+				    DBM_t invariant){}
+      void backward_assign_bool_var(variable_t lhs, variable_t rhs, bool is_not_rhs,
+				      DBM_t invariant) {}
+      void backward_apply_binary_bool(bool_operation_t op,
+				      variable_t x,variable_t y,variable_t z,
+				      DBM_t invariant) {}
+      // array operations
+      void array_init(variable_t a, linear_expression_t elem_size,
+		      linear_expression_t lb_idx, linear_expression_t ub_idx, 
+		      linear_expression_t val) {}      
+      void array_load(variable_t lhs,
+		      variable_t a, linear_expression_t elem_size,
+		      linear_expression_t i) {}
+      void array_store(variable_t a, linear_expression_t elem_size,
+		       linear_expression_t i, linear_expression_t v, 
+		       bool is_singleton) {}
+      void array_store_range(variable_t a, linear_expression_t elem_size,
+			     linear_expression_t i, linear_expression_t j,
+			     linear_expression_t v) {}                        
+      void array_assign(variable_t lhs, variable_t rhs) {}
+      // pointer operations
+      void pointer_load(variable_t lhs, variable_t rhs)  {}
+      void pointer_store(variable_t lhs, variable_t rhs) {} 
+      void pointer_assign(variable_t lhs, variable_t rhs, linear_expression_t offset) {}
+      void pointer_mk_obj(variable_t lhs, ikos::index_t address) {}
+      void pointer_function(variable_t lhs, varname_t func) {}
+      void pointer_mk_null(variable_t lhs) {}
+      void pointer_assume(pointer_constraint_t cst) {}
+      void pointer_assert(pointer_constraint_t cst) {}
+      /* End unimplemented operations */
+      
+      void expand(variable_t x, variable_t y) {
+	lock(); norm().expand(x, y);
+      }
+      void forget(const variable_vector_t& vars) {
+	lock(); norm().forget(vars);
+      }
+      void project(const variable_vector_t& vars) {
+	lock(); norm().project(vars);
+      }
+      void rename(const variable_vector_t &from, const variable_vector_t &to) {
+	lock(); norm().rename(from, to);
+      }
       void extract(const variable_t& x, linear_constraint_system_t& csts,
-		   bool only_equalities)
-      { lock(); norm().extract(x, csts, only_equalities); }
+		   bool only_equalities) {
+	lock(); norm().extract(x, csts, only_equalities);
+      }
 
       void write(crab_os& o) { norm().write(o); }
 
-      linear_constraint_system_t to_linear_constraint_system () {
+      linear_constraint_system_t to_linear_constraint_system() {
         return norm().to_linear_constraint_system();
       }
-      disjunctive_linear_constraint_system_t to_disjunctive_linear_constraint_system () {
+      disjunctive_linear_constraint_system_t to_disjunctive_linear_constraint_system() {
         return norm().to_disjunctive_linear_constraint_system();
       }
       
-      static std::string getDomainName () { return dbm_impl_t::getDomainName(); }
+      static std::string getDomainName() { return dbm_impl_t::getDomainName(); }
       std::pair<std::size_t, std::size_t> size() const {
 	return norm().size();
       }
-      bool is_unsat (linear_constraint_t cst){ return norm().is_unsat(cst);}
+      bool is_unsat(linear_constraint_t cst){ return norm().is_unsat(cst);}
       void active_variables(std::vector<variable_t>& out){ norm().active_variables(out);}
       
     protected:  
       dbm_ref_t base_ref;  
       dbm_ref_t norm_ref;
     };
+
     #endif 
 
-    template<typename Number, typename VariableName, typename SplitDBMParams>
-    class domain_traits <SplitDBM<Number,VariableName,SplitDBMParams>> {
-     public:
-
-      typedef SplitDBM<Number,VariableName,SplitDBMParams> sdbm_domain_t;
-      typedef ikos::variable<Number, VariableName> variable_t;
-      
-      template<class CFG>
-      static void do_initialization (CFG cfg) { }
-
-      static void expand (sdbm_domain_t& inv, variable_t x, variable_t new_x) {
-        inv.expand (x, new_x);
-      }
+    template<typename Number, typename VariableName, typename SplitDBMParams>    
+    struct abstract_domain_traits<SplitDBM<Number, VariableName, SplitDBMParams>> {
+      typedef Number number_t;
+      typedef VariableName varname_t;       
+    };        
     
-      static void normalize (sdbm_domain_t& inv) {
-        inv.normalize();
-      }
-    
-      template <typename Iter>
-      static void forget (sdbm_domain_t& inv, Iter it, Iter end){
-        inv.forget (it, end);
-      }
-
-      template <typename Iter>
-      static void project (sdbm_domain_t& inv, Iter it, Iter end) {
-        inv.project (it, end);
-      }
-    };
-
-
     template<typename Number, typename VariableName, typename SplitDBMParams>    
     class reduced_domain_traits<SplitDBM<Number, VariableName, SplitDBMParams>> {
     public:
@@ -2780,21 +2739,24 @@ namespace crab {
       typedef typename sdbm_domain_t::linear_constraint_system_t linear_constraint_system_t;
       
       static void extract(sdbm_domain_t& dom, const variable_t& x,
-			  linear_constraint_system_t& csts, bool only_equalities)
-      { dom.extract(x, csts, only_equalities); }
+			  linear_constraint_system_t& csts, bool only_equalities) {
+	dom.extract(x, csts, only_equalities);
+      }
     };
   
     template<typename Number, typename VariableName, typename SplitDBMParams>
-    struct array_sgraph_domain_traits <SplitDBM<Number,VariableName, SplitDBMParams>> {
+    struct array_sgraph_domain_helper_traits <SplitDBM<Number,VariableName, SplitDBMParams>> {
       typedef SplitDBM<Number,VariableName,SplitDBMParams> sdbm_domain_t;
       typedef typename sdbm_domain_t::linear_constraint_t linear_constraint_t;
       typedef ikos::variable<Number, VariableName> variable_t;
       
-      static bool is_unsat(sdbm_domain_t &inv, linear_constraint_t cst) 
-      { return inv.is_unsat(cst); }
+      static bool is_unsat(sdbm_domain_t &inv, linear_constraint_t cst) { 
+	return inv.is_unsat(cst);
+      }
       
-      static void active_variables(sdbm_domain_t &inv, std::vector<variable_t>& out) 
-      { inv.active_variables(out); }
+      static void active_variables(sdbm_domain_t &inv, std::vector<variable_t>& out) {
+	inv.active_variables(out);
+      }
     };
   
   } // namespace domains

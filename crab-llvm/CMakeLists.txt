@@ -130,7 +130,6 @@ if (GIT_FOUND)
   endif ()
 
   set (CRAB_REPO "https://github.com/seahorn/crab.git" CACHE STRING "crab repo")
-  set (CRAB_LOCAL "${CMAKE_SOURCE_DIR}/../crab" CACHE STRING "crab local")
   
   if (TopLevel)
     set (CRAB_ROOT "${CMAKE_SOURCE_DIR}/crab" CACHE STRING "crab root directory")
@@ -138,12 +137,9 @@ if (GIT_FOUND)
     set (CRAB_ROOT "${CMAKE_SOURCE_DIR}/crab-llvm/crab" CACHE STRING "crab root directory")
   endif ()
   
-#  add_custom_target (crab-git
-#     		     ${GIT_EXECUTABLE} clone ${CRAB_REPO} ${CRAB_ROOT})
-
   add_custom_target (crab-git
-               ln -s ${CRAB_LOCAL} ${CRAB_ROOT})
-
+     		     ${GIT_EXECUTABLE} clone -b oct ${CRAB_REPO} ${CRAB_ROOT})
+  
   add_custom_target (crab ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_LIST_FILE}
                      DEPENDS crab-git)    
 

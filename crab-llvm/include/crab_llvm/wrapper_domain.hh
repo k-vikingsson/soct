@@ -33,7 +33,7 @@ namespace llvm {
   DUMP_TO_LLVM_STREAM(crab_llvm::wrapped_interval_domain_t)
   DUMP_TO_LLVM_STREAM(crab_llvm::ric_domain_t)
   DUMP_TO_LLVM_STREAM(crab_llvm::split_dbm_domain_t)
-  DUMP_TO_LLVM_STREAM(crab_llvm::split_oct_domain_t)
+  DUMP_TO_LLVM_STREAM(crab_llvm::split_oct_domain_t)  
   DUMP_TO_LLVM_STREAM(crab_llvm::boxes_domain_t)
   DUMP_TO_LLVM_STREAM(crab_llvm::dis_interval_domain_t)
   DUMP_TO_LLVM_STREAM(crab_llvm::num_domain_t)
@@ -116,15 +116,11 @@ namespace crab_llvm {
     }								     \
     								     \
     void forget(const std::vector<var_t>& vars) {		     \
-      crab::domains::domain_traits<ABS_DOM>::forget(m_abs,	     \
-						    vars.begin(),    \
-						    vars.end());     \
+      m_abs.forget(vars);					     \
     }								     \
     								     \
     void project(const std::vector<var_t>& vars) {		     \
-       crab::domains::domain_traits<ABS_DOM>::project(m_abs,         \
-                                                      vars.begin(),  \
-                                                      vars.end());   \
+      m_abs.project(vars);					     \
     }								     \
     								     \
    };                                                                \
@@ -207,7 +203,7 @@ namespace crab_llvm {
    DEFINE_WRAPPER(WrappedIntervalDomainWrapper,wrapped_interval_domain_t,w_intv)
    DEFINE_WRAPPER(RicDomainWrapper,ric_domain_t,ric)
    DEFINE_WRAPPER(SDbmDomainWrapper,split_dbm_domain_t,split_dbm)
-   DEFINE_WRAPPER(SOctDomainWrapper,split_oct_domain_t,split_oct)
+   DEFINE_WRAPPER(SOctDomainWrapper,split_oct_domain_t,split_oct)   
    DEFINE_WRAPPER(TermIntDomainWrapper,term_int_domain_t,term_intv)
    DEFINE_WRAPPER(TermDisIntDomainWrapper,term_dis_int_domain_t,term_dis_intv)
    DEFINE_WRAPPER(BoxesDomainWrapper,boxes_domain_t,boxes)

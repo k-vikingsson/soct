@@ -432,200 +432,6 @@ namespace crab {
     vert_id v_ex;
   };
 
-  // View of a graph, omitting a given vertex
-  template<class G>
-  class SplitGraph {
-  public:
-    typedef typename G::vert_id vert_id;
-    typedef typename G::Wt Wt;
-
-    typedef typename G::pred_range g_pred_range;
-    typedef typename G::succ_range g_succ_range;
-
-    typedef typename G::e_pred_range g_e_pred_range;
-    typedef typename G::e_succ_range g_e_succ_range;
-
-    typedef typename G::mut_val_ref_t mut_val_ref_t;
-
-    SplitGraph(G& _g)
-      : g(_g)
-    { }
-
-     
-    bool elem(vert_id x, vert_id y) const {
-      return ((x / 2 != y / 2) && g.elem(x, y));
-    }
-
-    bool lookup(vert_id x, vert_id y, mut_val_ref_t* w) const {
-      return ((x / 2 != y / 2) && g.lookup(x, y, w));
-    }
-
-    Wt edge_val(vert_id x, vert_id y) const {
-      return g.edge_val(x, y);  
-    }
-
-    // Precondition: elem(x, y) is true.
-    Wt operator()(vert_id x, vert_id y) const {
-      return g(x, y);
-    }
-
-    void clear_edges(void) { g.clear_edges(); }
-
-    void clear(void)
-    {
-      assert(0 && "SplitGraph::clear not implemented.");       
-    }
-
-    // Number of allocated vertices
-    int size(void) const {
-      return g.size();
-    }
-
-    // Assumption: (x, y) not in mtx
-    void add_edge(vert_id x, Wt wt, vert_id y)
-    {
-//      assert(x != v_ex && y != v_ex);
-      g.add_edge(x, wt, y);
-    }
-
-    void set_edge(vert_id s, Wt w, vert_id d)
-    {
-//      assert(s != v_ex && d != v_ex);
-      g.set_edge(s, w, d);
-    }
-
-    template<class Op>
-    void update_edge(vert_id s, Wt w, vert_id d, Op& op)
-    {
-//      assert(s != v_ex && d != v_ex);
-      g.update_edge(s, w, d, op);
-    }
-
-    class vert_iterator {
-    public:
-      vert_iterator(const typename G::vert_iterator& _iG)
-        : iG(_iG)
-      { }
-
-      // Skipping of v_ex is done entirely by !=.
-      // So we _MUST_ test it != verts.end() before dereferencing.
-      vert_id operator*(void) { return *iG; }
-      vert_iterator operator++(void) { ++iG; return *this; } 
-      bool operator!=(const vert_iterator& o) {
-        return iG != o.iG;
-      }
-      
-      typename G::vert_iterator iG; 
-    };
-    class vert_range {
-    public:
-      vert_range(const typename G::vert_range& _rG)
-        : rG(_rG)
-      { }
-
-      vert_iterator begin(void) const { return vert_iterator(rG.begin()); }
-      vert_iterator end(void) const { return vert_iterator(rG.end()); }
-
-      typename G::vert_range rG;
-    };
-    vert_range verts(void) const { return vert_range(g.verts()); }
-
-    template<class It>
-    class adj_iterator {
-    public:
-      adj_iterator(const It& _iG, vert_id _v_ex)
-        : iG(_iG), v_ex(_v_ex)
-      { }
-      vert_id operator*(void) const { return *iG; }
-      adj_iterator& operator++(void) { ++iG; return *this; }
-      bool operator!=(const adj_iterator& o)
-      {
-        if(iG != o.iG && (*iG) == v_ex)
-          ++iG;
-        return iG != o.iG;
-      }
-
-      It iG;
-      vert_id v_ex;
-    };
-
-    template<class It>
-    class e_adj_iterator {
-    public:
-      typedef typename It::edge_ref edge_ref;
-
-      e_adj_iterator(const It& _iG, vert_id _v_ex)
-        : iG(_iG), v_ex(_v_ex)
-      { }
-      edge_ref operator*(void) const { return *iG; }
-      e_adj_iterator& operator++(void) { ++iG; return *this; }
-      bool operator!=(const e_adj_iterator& o)
-      {
-        if(iG != o.iG && (*iG).vert == v_ex)
-          ++iG;
-        return iG != o.iG;
-      }
-
-      It iG;
-      vert_id v_ex;
-    };
-
-    template<class R, class It>
-    class adj_list {
-    public: 
-      typedef typename R::iterator g_iter;
-      typedef It iterator;
-
-      adj_list(const R& _rG, vert_id _v_ex)
-        : rG(_rG), v_ex(_v_ex)
-      { }
-      iterator begin() const { return iterator(rG.begin(), v_ex); }
-      iterator end() const { return iterator(rG.end(), v_ex); }
-      
-    protected:
-      R rG;
-      vert_id v_ex;
-    };
-    typedef adj_list<g_pred_range,
-              adj_iterator<typename g_pred_range::iterator> > pred_range;
-    typedef adj_list<g_succ_range,
-              adj_iterator<typename g_succ_range::iterator> > succ_range;
-
-    typedef adj_list<g_e_pred_range,
-              e_adj_iterator<typename g_e_pred_range::iterator> > e_pred_range;
-    typedef adj_list<g_e_succ_range,
-              e_adj_iterator<typename g_e_succ_range::iterator> > e_succ_range;
-
-    succ_range succs(vert_id v) {
-//      assert(v != v_ex);
-      vert_id v_opp;
-      if (v % 2 == 0) v_opp = v + 1;
-      else v_opp = v - 1;
-      return succ_range(g.succs(v), v_opp);
-    }
-    pred_range preds(vert_id v) {
-//      assert(v != v_ex);
-      vert_id v_opp;
-      if (v % 2 == 0) v_opp = v + 1;
-      else v_opp = v - 1;
-      return pred_range(g.preds(v), v_opp);
-    }
-    e_succ_range e_succs(vert_id v) {
-      vert_id v_opp;
-      if (v % 2 == 0) v_opp = v + 1;
-      else v_opp = v - 1;
-      return e_succ_range(g.e_succs(v), v_opp);
-    }
-    e_pred_range e_preds(vert_id v) {
-      vert_id v_opp;
-      if (v % 2 == 0) v_opp = v + 1;
-      else v_opp = v - 1;
-      return e_pred_range(g.e_preds(v), v_opp);
-    }
-
-    G& g;
-  };
-  
   // Viewing a graph with all edges reversed.
   // Useful if we want to run single-dest shortest paths,
   // for updating bounds and incremental closure.
@@ -1111,26 +917,24 @@ r_not_dom:
         g.set_edge(e.first.first, e.second, e.first.second);
       }
     }
-    
-    static void apply_delta(graph_t& g, edge_vector& delta, bool is_oct)
-    {
-        mut_val_ref_t w;
-        for(std::pair< std::pair<vert_id, vert_id>, Wt>& e : delta) {
-        
-            //if (!is_oct || e.first.first/2 != e.first.second/2) {
-            CRAB_LOG("octagon-assign", crab::outs() << "Applied graph" << g <<"\n");
-            CRAB_LOG("octagon-assign", crab::outs() << "Applying delta: (" << e.first.first << ", " << e.first.second << ") = "<< e.second <<"\n");
-            if (!g.lookup(e.first.first, e.first.second, &w) || e.second < w){
-                CRAB_LOG("octagon-assign", crab::outs() << "Applying delta w: "<< w <<"\n");
-                //if (){
-                    
-                g.set_edge(e.first.first, Wt(e.second), e.first.second);
-                CRAB_LOG("octagon-assign", crab::outs() << "Applying delta set\n");
-                
-            }
-        }
-    }
 
+    /* 
+       Added for octagons. 
+       JN: Need to double check this. Typically apply_delta takes as
+       input edges that we know they already have more precise weights
+       than existing ones. If that's the case this function is
+       unnecessary.
+    */
+    static void update_delta(graph_t& g, edge_vector& delta) 
+    {
+      mut_val_ref_t w;
+      for(std::pair< std::pair<vert_id, vert_id>, Wt>& e : delta) {
+	if (!g.lookup(e.first.first, e.first.second, &w) || e.second < w){
+	  g.set_edge(e.first.first, Wt(e.second), e.first.second);
+	}
+      }
+    }
+    
     // Straight implementation of Dijkstra's algorithm
     template<class G, class P>
     static void dijkstra(G& g, const P& p, vert_id src,

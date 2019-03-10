@@ -27,9 +27,9 @@ namespace crab {
 
    public:
 
-    checks_db ()
+    checks_db()
         : m_total_safe(0), m_total_err(0), 
-          m_total_unreach(0), m_total_warn (0) { }
+          m_total_unreach(0), m_total_warn(0) { }
 
     void clear() {
       m_db.clear();
@@ -39,34 +39,34 @@ namespace crab {
       m_total_warn = 0;
     }
     
-    unsigned get_total_safe () const { return m_total_safe + m_total_unreach; }
+    unsigned get_total_safe() const { return m_total_safe + m_total_unreach; }
 
-    unsigned get_total_warning () const { return m_total_warn; }
+    unsigned get_total_warning() const { return m_total_warn; }
 
-    unsigned get_total_error () const { return m_total_err; }
+    unsigned get_total_error() const { return m_total_err; }
 
     // add an entry in the database
-    void add (check_kind_t status, crab::cfg::debug_info dbg = crab::cfg::debug_info () ) {
+    void add(check_kind_t status, crab::cfg::debug_info dbg = crab::cfg::debug_info()){
       switch (status) {
         case _SAFE: m_total_safe++;break;
         case _ERR : m_total_err++;break;
         case _UNREACH: m_total_unreach++;break;
         default: m_total_warn++;
       }
-      if (dbg.has_debug ())
-        m_db.insert (check_t (dbg, status));
+      if (dbg.has_debug())
+        m_db.insert(check_t(dbg, status));
     }
     
     // merge two databases
     void operator+=(const checks_db& other) {
-      m_db.insert (other.m_db.begin (), other.m_db.end ());
+      m_db.insert(other.m_db.begin(), other.m_db.end());
       m_total_safe += other.m_total_safe;
       m_total_err += other.m_total_err;
       m_total_warn += other.m_total_warn;
       m_total_unreach += other.m_total_unreach;
     }
     
-    void write (crab_os& o) const {
+    void write(crab_os& o) const {
       std::vector<unsigned> cnts = { m_total_safe, m_total_err, 
                                      m_total_warn, m_total_unreach };
       unsigned MaxValLen = 0;
@@ -75,14 +75,14 @@ namespace crab {
                              (unsigned)std::to_string(c).size());
       }
       
-      o << std::string ((int) MaxValLen - std::to_string(m_total_safe).size(), ' ') 
-        << m_total_safe << std::string (2, ' ') << "Number of total safe checks\n";
-      o << std::string ((int) MaxValLen - std::to_string(m_total_err).size(), ' ') 
-        << m_total_err << std::string (2, ' ') << "Number of total error checks\n";
-      o << std::string ((int) MaxValLen - std::to_string(m_total_warn).size(), ' ') 
-        << m_total_warn << std::string (2, ' ') << "Number of total warning checks\n";
-      o << std::string ((int) MaxValLen - std::to_string(m_total_unreach).size(), ' ') 
-        << m_total_unreach << std::string (2, ' ') << "Number of total unreachable checks\n";
+      o << std::string((int) MaxValLen - std::to_string(m_total_safe).size(), ' ') 
+        << m_total_safe << std::string(2, ' ') << "Number of total safe checks\n";
+      o << std::string((int) MaxValLen - std::to_string(m_total_err).size(), ' ') 
+        << m_total_err << std::string(2, ' ') << "Number of total error checks\n";
+      o << std::string((int) MaxValLen - std::to_string(m_total_warn).size(), ' ') 
+        << m_total_warn << std::string(2, ' ') << "Number of total warning checks\n";
+      o << std::string((int) MaxValLen - std::to_string(m_total_unreach).size(), ' ') 
+        << m_total_unreach << std::string(2, ' ') << "Number of total unreachable checks\n";
 
       unsigned MaxFileLen = 0;
       for (auto const &p: m_db) {
@@ -98,8 +98,8 @@ namespace crab {
           default:       o << "warning: "; break;
         }
         // print all checks here
-        // o << p.first.m_file << std::string ((int) MaxFileLen - p.first.m_file.size(), ' ') 
-        //   << std::string (2, ' ')
+        // o << p.first.m_file << std::string((int) MaxFileLen - p.first.m_file.size(), ' ') 
+        //   << std::string(2, ' ')
         //   << " line " << p.first.m_line 
         //   << " col " << p.first.m_col << "\n";
       }
@@ -107,51 +107,12 @@ namespace crab {
     
   };
 
-  #define LOG_SAFE(VERBOSE,INV,PROP,DEBUG_LOC)           \
-  do {                                                   \
-    this->m_db.add (_SAFE);                              \
-    if (VERBOSE >=3) {                                   \
-      crab::outs() << " --- SAFE -----------------\n";   \
-      if (DEBUG_LOC.has_debug ())                        \
-         crab::outs() << DEBUG_LOC << "\n";              \
-      crab::outs() << "Property : " << PROP << "\n";     \
-      crab::outs() << "Invariant: " << INV << "\n";      \
-      crab::outs() << " -----------------------------\n";\
-    }                                                    \
-  } while (false);
-
-  #define LOG_WARN(VERBOSE,INV,PROP,DEBUG_LOC)            \
-  do {                                                    \
-    this->m_db.add (_WARN, DEBUG_LOC);                    \
-    if (VERBOSE >=2) {                                    \
-      crab::outs() << " --- WARNING -----------------\n"; \
-      if (DEBUG_LOC.has_debug ())                         \
-         crab::outs() << DEBUG_LOC << "\n";               \
-      crab::outs() << "Property : " << PROP << "\n";      \
-      crab::outs() << "Invariant: " << INV << "\n";       \
-      crab::outs() << " -----------------------------\n"; \
-    }                                                     \
-  } while (false);  
-
-  #define LOG_ERR(VERBOSE,INV,PROP,DEBUG_LOC)             \
-  do {                                                    \
-    this->m_db.add (_ERR, DEBUG_LOC);                     \
-    if (VERBOSE >=1) {                                    \
-       crab::outs() << " --- ERROR -----------------\n";  \
-       if (DEBUG_LOC.has_debug ())                        \
-           crab::outs() << DEBUG_LOC << "\n";             \
-       crab::outs() << "Property : " << PROP << "\n";     \
-       crab::outs() << "Invariant: " << INV << "\n";      \
-       crab::outs() << " -----------------------------\n";\
-    }                                                     \
-  } while (false); 
-
   template<typename Analyzer>
   class property_checker:
-      public crab::cfg::statement_visitor <typename Analyzer::number_t,
-					   typename Analyzer::varname_t> {
+      public crab::cfg::statement_visitor<typename Analyzer::number_t,
+					  typename Analyzer::varname_t> {
    public:
-    typedef typename Analyzer::abs_tr_ptr abs_tr_ptr;
+    typedef typename Analyzer::abs_tr_t abs_tr_t;
     typedef typename Analyzer::varname_t varname_t;
     typedef typename Analyzer::number_t number_t;
     typedef typename Analyzer::abs_dom_t abs_dom_t;
@@ -161,6 +122,7 @@ namespace crab {
     typedef typename abs_dom_t::linear_constraint_t lin_cst_t;
     typedef typename abs_dom_t::linear_constraint_system_t lin_cst_sys_t;
 
+    typedef crab::cfg::statement<number_t, varname_t>        statement_t;
     typedef crab::cfg::binary_op<number_t,varname_t>         bin_op_t;
     typedef crab::cfg::assignment<number_t,varname_t>        assign_t;
     typedef crab::cfg::assume_stmt<number_t,varname_t>       assume_t;
@@ -189,197 +151,262 @@ namespace crab {
     typedef crab::cfg::bool_assert_stmt<number_t,varname_t>  bool_assert_t;
     typedef crab::cfg::bool_select_stmt<number_t,varname_t>  bool_select_t;    
 
-    typedef std::set<std::pair<crab::cfg::debug_info, check_kind_t>> check_results_db;
- 
    protected: 
 
-    abs_tr_ptr m_abs_tr; // it can be null
+    // The abstract transformer
+    abs_tr_t* m_abs_tr; 
+    // Verbosity to print user messages
     int m_verbose;
-    checks_db m_db; // Store debug information about the checks
-   
-    virtual void check (assert_t& s) { 
-      if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
-    }
-
-    virtual void check (bin_op_t& s) { 
-      if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
-    } 
+    // Store debug information about the checks
+    checks_db m_db;
+    // Statements where checks occur
+    std::vector<const statement_t*> m_safe_checks;
+    std::vector<const statement_t*> m_warning_checks;
+    std::vector<const statement_t*> m_error_checks;    
+    
+    void add_safe(int verbosity, std::string msg, const statement_t* s) {
+      m_db.add(_SAFE);
+      m_safe_checks.push_back(s);
       
-    virtual void check (assign_t& s) { 
-      if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+      if (verbosity >=3) {				
+	crab::outs() << " --- SAFE --------------------\n"; 
+	if (s->get_debug_info().has_debug()) {      
+	  crab::outs() << s->get_debug_info() << "\n";
+	}
+	crab::outs() << msg << "\n";
+	crab::outs() << " -----------------------------\n";
+      }
     }
+
+    void add_warning(int verbosity, std::string msg, const statement_t* s) {
+      m_db.add(_WARN, s->get_debug_info());
+      m_warning_checks.push_back(s);
       
-    virtual void check (assume_t& s) { 
-      if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+      if (verbosity >= 2) {				
+	crab::outs() << " --- WARNING -----------------\n"; 
+	if (s->get_debug_info().has_debug()) {      
+	  crab::outs() << s->get_debug_info() << "\n";
+	}
+	crab::outs() << msg << "\n";
+	crab::outs() << " -----------------------------\n";
+      }
     }
 
-    virtual void check (select_t& s) { 
-      if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
-    }
-
-    virtual void check (int_cast_t& s) { 
-      if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+    void add_error(int verbosity, std::string msg, const statement_t* s) {
+      m_db.add(_ERR, s->get_debug_info());
+      m_error_checks.push_back(s);
+      
+      if (verbosity >= 1) {				
+	crab::outs() << " --- ERROR -------------------\n"; 
+	if (s->get_debug_info().has_debug()) {      
+	  crab::outs() << s->get_debug_info() << "\n";
+	}
+	crab::outs() << msg << "\n";
+	crab::outs() << " -----------------------------\n";
+      }
     }
     
-    virtual void check (havoc_t& s) { 
+    virtual void check(assert_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
+    }
+
+    virtual void check(bin_op_t& s) { 
+      if (!this->m_abs_tr) return;        
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
+    } 
+      
+    virtual void check(assign_t& s) { 
+      if(!this->m_abs_tr) return;        
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (unreach_t& s) { 
+    virtual void check(assume_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
+    }
+
+    virtual void check(select_t& s) { 
+      if (!this->m_abs_tr) return;        
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
+    }
+
+    virtual void check(int_cast_t& s) { 
+      if (!this->m_abs_tr) return;        
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
+    }
+    
+    virtual void check(havoc_t& s) { 
+      if (!this->m_abs_tr) return;        
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
+    }
+      
+    virtual void check(unreach_t& s) { 
+      if (!this->m_abs_tr) return;        
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
             
-    virtual void check (callsite_t& s) { 
+    virtual void check(callsite_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (return_t& s) {
+    virtual void check(return_t& s) {
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt 
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt 
     }
       
-    virtual void check (arr_init_t& s) { 
+    virtual void check(arr_init_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
     
-    virtual void check (arr_store_t& s) { 
+    virtual void check(arr_store_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (arr_load_t& s) { 
+    virtual void check(arr_load_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (ptr_store_t& s) { 
+    virtual void check(ptr_store_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (ptr_load_t& s) { 
+    virtual void check(ptr_load_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (ptr_assign_t& s) { 
+    virtual void check(ptr_assign_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (ptr_object_t& s) { 
+    virtual void check(ptr_object_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (ptr_function_t& s) { 
+    virtual void check(ptr_function_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (ptr_null_t& s) { 
+    virtual void check(ptr_null_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (ptr_assume_t& s) { 
+    virtual void check(ptr_assume_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
       
-    virtual void check (ptr_assert_t&s) { 
+    virtual void check(ptr_assert_t&s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
 
-    virtual void check (bool_assert_t& s) { 
+    virtual void check(bool_assert_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
 
-    virtual void check (bool_bin_op_t& s) { 
+    virtual void check(bool_bin_op_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     } 
       
-    virtual void check (bool_assign_cst_t& s) { 
+    virtual void check(bool_assign_cst_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
 
-    virtual void check (bool_assign_var_t& s) { 
+    virtual void check(bool_assign_var_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
     
-    virtual void check (bool_assume_t& s) { 
-      if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+    virtual void check(bool_assume_t& s) { 
+      if(!this->m_abs_tr) return;        
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
 
-    virtual void check (bool_select_t& s) { 
+    virtual void check(bool_select_t& s) { 
       if (!this->m_abs_tr) return;        
-        s.accept (&*this->m_abs_tr); // propagate m_inv to the next stmt
+        s.accept(&*this->m_abs_tr); // propagate m_inv to the next stmt
     }
     
    public: 
 
     /* Visitor API */
-    void visit (bin_op_t &s) { check (s); }
-    void visit (assign_t &s) { check (s); }
-    void visit (assume_t &s) { check (s); }
-    void visit (select_t &s) { check (s); }
-    void visit (assert_t &s) { check (s); }
-    void visit (int_cast_t &s) { check (s); }        
-    void visit (havoc_t &s) { check (s); }
-    void visit (unreach_t &s) { check (s); }
-    void visit (callsite_t &s) { check (s); }
-    void visit (return_t &s) { check (s); }
-    void visit (arr_init_t &s) { check (s); }
-    void visit (arr_store_t &s) { check (s); }
-    void visit (arr_load_t &s) { check (s); }
-    void visit (ptr_store_t &s) { check (s); }
-    void visit (ptr_load_t &s) { check (s); }
-    void visit (ptr_assign_t &s) { check (s); }
-    void visit (ptr_object_t &s) { check (s); }
-    void visit (ptr_function_t &s) { check (s); }
-    void visit (ptr_null_t &s) { check (s); }
-    void visit (ptr_assert_t &s) { check (s); }
-    void visit (bool_bin_op_t &s) { check (s); }
-    void visit (bool_assign_cst_t &s) { check (s); }
-    void visit (bool_assign_var_t &s) { check (s); }    
-    void visit (bool_assume_t &s) { check (s); }
-    void visit (bool_select_t &s) { check (s); }
-    void visit (bool_assert_t &s) { check (s); }    
+    void visit(bin_op_t &s) { check(s); }
+    void visit(assign_t &s) { check(s); }
+    void visit(assume_t &s) { check(s); }
+    void visit(select_t &s) { check(s); }
+    void visit(assert_t &s) { check(s); }
+    void visit(int_cast_t &s) { check(s); }        
+    void visit(havoc_t &s) { check(s); }
+    void visit(unreach_t &s) { check(s); }
+    void visit(callsite_t &s) { check(s); }
+    void visit(return_t &s) { check(s); }
+    void visit(arr_init_t &s) { check(s); }
+    void visit(arr_store_t &s) { check(s); }
+    void visit(arr_load_t &s) { check(s); }
+    void visit(ptr_store_t &s) { check(s); }
+    void visit(ptr_load_t &s) { check(s); }
+    void visit(ptr_assign_t &s) { check(s); }
+    void visit(ptr_object_t &s) { check(s); }
+    void visit(ptr_function_t &s) { check(s); }
+    void visit(ptr_null_t &s) { check(s); }
+    void visit(ptr_assert_t &s) { check(s); }
+    void visit(bool_bin_op_t &s) { check(s); }
+    void visit(bool_assign_cst_t &s) { check(s); }
+    void visit(bool_assign_var_t &s) { check(s); }    
+    void visit(bool_assume_t &s) { check(s); }
+    void visit(bool_select_t &s) { check(s); }
+    void visit(bool_assert_t &s) { check(s); }    
     
-    property_checker (int verbose): 
-        m_abs_tr (nullptr), m_verbose (verbose) { }
+    property_checker(int verbose)
+      : m_abs_tr(nullptr)
+      , m_verbose(verbose) { }
+      
     
-    void set (abs_tr_ptr abs_tr) {
+    void set(abs_tr_t* abs_tr) {
       m_abs_tr = abs_tr;
     }
     
-    const checks_db& get_db () const { return m_db; }
+    const checks_db& get_db() const {
+      return m_db;
+    }
     
-    checks_db get_db () { return m_db; }
+    checks_db get_db() {
+      return m_db;
+    }
 
-    virtual std::string get_property_name () const {
+    const std::vector<const statement_t*>& get_safe_checks() const {
+      return m_safe_checks;
+    }
+
+    const std::vector<const statement_t*>& get_warning_checks() const {
+      return m_warning_checks;
+    }
+
+    const std::vector<const statement_t*>& get_error_checks() const {
+      return m_error_checks;
+    }
+    
+    virtual std::string get_property_name() const {
        return "dummy property";
     }
 
-    void write (crab_os& o) const {
-      o << get_property_name () << "\n";
-      m_db.write (o);
+    void write(crab_os& o) const {
+      o << get_property_name() << "\n";
+      m_db.write(o);
     }
 
   };  

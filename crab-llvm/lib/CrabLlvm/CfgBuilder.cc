@@ -10,14 +10,26 @@
  * In addition, there is an array type which is a type that it doesn't
  * exist in LLVM but it does in Crab. An array is a sequence of
  * consecutive bytes for which certain guarantees hold (e.g., sequence
- * elements have compatible types and they are always accessed in the
- * same way). Arrays are identified using HeapAbstraction.
+ * elements have compatible types and they are always accessed with
+ * the same number of bytes). Arrays are identified using HeapAbstraction.
  * 
  * Known limitations of the translation:
  * 
  * - Ignore floating point instructions.
  * - Ignore inttoptr/ptrtoint instructions.
+ * - Almost ignore memset/memmove/memcpy
  */
+
+/*
+  FIXME: array operations take as indexes pointer expressions.  They
+  must be integer expressions. This requires some pre-analysis to
+  figure out if the pointer operand or the load/store is the base
+  address of the accessed memory region. 
+
+  FIXME: we do some imprecise array initialization (e.g., alloca) that
+  is useful for array smashing. Revisit this once we use a more
+  powerful array domain. 
+*/
 
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/CallSite.h"
@@ -673,14 +685,18 @@ namespace crab_llvm {
      Helpers for memory regions.
 
      We don't add array statements for memory regions containing
-     pointers. This means that if the load's lhs or store pointer
+     pointers. This means that if the load's lhs or store value
      operand is a pointer we only add the corresponding pointer
      statement (ptr_load/ptr_store) but not any extra array statement
-     (array_load/array_store). The reason is that, e.g., for the lhs
-     of a load instruction, the same variable name would be used both
-     for ptr_load and array_load with contradicting types.
-  */
+     (array_load/array_store). 
 
+     FIXME: If we would want to add array statements with elements of
+     pointer type, we need to do some renaming. Otherwise, for
+     instance, for the lhs of a load instruction, the same variable
+     name would be used both for ptr_load and array_load with
+     contradicting types.
+  */
+  
   static inline mem_region_t
   get_region(HeapAbstraction &mem, Function& f, Value*v) {
     mem_region_t res = mem.getRegion(f, v);
@@ -1476,7 +1492,7 @@ namespace crab_llvm {
     }
     
     var_t doBoolLogicOp(Instruction::BinaryOps op,
-			/* ref can null */
+			/* ref can be null */
 			crab_lit_ref_t ref, const Value& v1, const Value& v2) {
       
       if (ref && !(ref->isBool())) {
@@ -1627,9 +1643,9 @@ namespace crab_llvm {
 	mem_region_t src_reg = GET_REGION(I,src);
 	mem_region_t dst_reg = GET_REGION(I,dst); 
 	if (dst_reg.isUnknown () || src_reg.isUnknown ()) return;
-	m_bb.havoc (m_lfac.mkArrayVar(dst_reg));
-	if (dst_reg.get_type () == src_reg.get_type()) {
-	  m_bb.array_assign (m_lfac.mkArrayVar(dst_reg), m_lfac.mkArrayVar(src_reg));
+	m_bb.havoc(m_lfac.mkArrayVar(dst_reg));
+	if (dst_reg.get_type() == src_reg.get_type()) {
+	  m_bb.array_assign(m_lfac.mkArrayVar(dst_reg), m_lfac.mkArrayVar(src_reg));
 	}
       } else if (MemSetInst *MSI = dyn_cast<MemSetInst>(&I)) {
 	if (CrabUnsoundArrayInit && isInteger(*(MSI->getValue()))) {
@@ -1648,18 +1664,19 @@ namespace crab_llvm {
 	    if (val_ref->isInt()) {
 	      if (m_init_regions.insert(r).second) {
 		if (val_ref->isVar()) {
-		  m_bb.array_init(arr_var, elem_size, lb_idx, ub_idx, val_ref->getVar());
+		  m_bb.array_init(arr_var, lb_idx, ub_idx, val_ref->getVar(), elem_size);
 	      } else {
-		  m_bb.array_init(arr_var, elem_size, lb_idx, ub_idx, m_lfac.getIntCst(val_ref));
+		  m_bb.array_init(arr_var, lb_idx, ub_idx, m_lfac.getIntCst(val_ref), elem_size);
 		}
 	      }
 	    } else if (val_ref->isBool()) {
 	      if (m_init_regions.insert(r).second) {	      
 		if (val_ref->isVar()) {
-		  m_bb.array_init(arr_var, elem_size,lb_idx, ub_idx, val_ref->getVar());
+		  m_bb.array_init(arr_var, lb_idx, ub_idx, val_ref->getVar(), elem_size);
 		} else {
-		  m_bb.array_init(arr_var, elem_size, lb_idx, ub_idx,
-				  m_lfac.isBoolTrue(val_ref) ? number_t(1): number_t(0));
+		  m_bb.array_init(arr_var, lb_idx, ub_idx,
+				  m_lfac.isBoolTrue(val_ref) ? number_t(1): number_t(0),
+				  elem_size);
 		}
 	      }
 	    } else if (val_ref->isPtr()) {
@@ -1667,6 +1684,8 @@ namespace crab_llvm {
 	      m_bb.havoc(arr_var);	      
 	    }
 	  }
+	} else {
+	  CRABLLVM_WARNING("Skipped memset instruction");
 	}
       } else if (isa<MemMoveInst>(&I)) {
 	CRABLLVM_WARNING("Skipped memmove instruction");
@@ -1726,7 +1745,7 @@ namespace crab_llvm {
 	    if (m_init_regions.insert(r).second) {	      	    
 	      IntegerType* int_ty = cast<IntegerType>(ty);
 	      ub_idx = ikos::z_number((int_ty->getBitWidth() / 8) -1);
-	      m_bb.array_init(a, elem_size, lb_idx, ub_idx, init_val);
+	      m_bb.array_init(a, lb_idx, ub_idx, init_val, elem_size);
 	    }
 	  } else if (isIntArray(*ty) || isBoolArray(*ty)) {
 	    if (cast<ArrayType>(ty)->getNumElements() == 0) {
@@ -1739,7 +1758,7 @@ namespace crab_llvm {
 	      if (m_init_regions.insert(r).second) {	      	    	      
 		elem_size = storageSize(cast<ArrayType>(ty)->getElementType());
 		ub_idx = lin_exp_t(cast<ArrayType>(ty)->getNumElements()* elem_size - 1);
-		m_bb.array_init(a, elem_size, lb_idx, ub_idx, init_val);
+		m_bb.array_init(a, lb_idx, ub_idx, init_val, elem_size);
 	      }
 	    }
 	  } else { /** unreachable **/ }
@@ -2467,18 +2486,21 @@ namespace crab_llvm {
 	}
       } else if (isPointer(*I.getPointerOperand(), m_lfac.get_track())) {
 	if (!val) {
-	  CRABLLVM_ERROR("unexpected value operand of store instruction",__FILE__, __LINE__);
-	}
-
-	if (val->isPtr() && m_lfac.isPtrNull(val)) {
-	  // XXX: we ignore the case if we store a null pointer. In
-	  // most cases, it will be fine since typical pointer
-	  // analyses ignore that case but it might be imprecise with
-	  // certain analyses.
+	  // this can happen e.g., with store double %_10, double* %_11
+	  // do nothing since we ignore floating point operations.
+	} else if (!val->isPtr()) {
+	  CRABLLVM_ERROR("expecting a value operand of pointer type in store instruction",
+			 __FILE__, __LINE__);
 	} else {
-	  m_bb.ptr_store(ptr->getVar(), val->getVar());
+	  if (!m_lfac.isPtrNull(val)) {
+	    // XXX: we ignore the case if we store a null pointer. In
+	    // most cases, it will be fine since typical pointer
+	    // analyses ignore that case but it might be imprecise with
+	    // certain analyses.
+	    m_bb.ptr_store(ptr->getVar(), val->getVar());
+	  }
 	}
-      } 
+      }
     }
 
     void visitAllocaInst (AllocaInst &I) {
@@ -2523,7 +2545,7 @@ namespace crab_llvm {
 		number_t init_val(0); 
 		number_t lb_idx(0); 
 		number_t ub_idx((numElems * elemSize) - 1);
-		m_bb.array_init(m_lfac.mkArrayVar(r), elemSize, lb_idx, ub_idx, init_val);
+		m_bb.array_init(m_lfac.mkArrayVar(r), lb_idx, ub_idx, init_val, elemSize);
 	      }
 	    }
 	  }

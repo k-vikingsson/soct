@@ -3,7 +3,6 @@
 
 using namespace std;
 using namespace crab::analyzer;
-using namespace crab::cfg;
 using namespace crab::cfg_impl;
 using namespace crab::domain_impl;
 
@@ -13,7 +12,8 @@ z_cfg_t* prog1 (variable_factory_t &vfac)  {
   // Definining program variables
   z_var i (vfac ["i"], crab::INT_TYPE, 32);
   z_var k (vfac ["k"], crab::INT_TYPE, 32);
-  z_var nd (vfac ["nd"], crab::INT_TYPE, 32);
+  z_var x1 (vfac ["x1"], crab::INT_TYPE, 32);
+  z_var x2 (vfac ["x2"], crab::INT_TYPE, 32);
   // entry and exit block
   z_cfg_t* cfg = new z_cfg_t("entry","ret");
   // adding blocks
@@ -28,11 +28,13 @@ z_cfg_t* prog1 (variable_factory_t &vfac)  {
   bb1 >> bb1_t; bb1 >> bb1_f;
   bb1_t >> bb2; bb2 >> bb1; bb1_f >> ret;
   // adding statements
+  //  entry.assign (x1, 1);
   entry.assign (k, 0);
   entry.assign (i, 0);
   bb1_t.assume (i <= 99);
   bb1_f.assume (i >= 100);
   bb2.add(i, i, 1);
+  //bb2.add (x2, x1, 1);
   bb2.add(k, k, 1);
   return cfg;
 }
@@ -40,7 +42,7 @@ z_cfg_t* prog1 (variable_factory_t &vfac)  {
 z_cfg_t* prog2 (variable_factory_t &vfac) 
 {
 
-  z_cfg_t* cfg = new z_cfg_t("loop1_entry","ret"); 
+  z_cfg_t* cfg = new z_cfg_t("loop1_entry","ret");
   z_basic_block_t& loop1_entry = cfg->insert ("loop1_entry");
   z_basic_block_t& loop1_bb1   = cfg->insert ("loop1_bb1");
   z_basic_block_t& loop1_bb1_t = cfg->insert ("loop1_bb1_t");
@@ -200,144 +202,114 @@ z_cfg_t* prog5 (variable_factory_t &vfac)  {
 z_cfg_t* prog6 (variable_factory_t &vfac)  {
 
   // Definining program variables
-  z_var x (vfac ["x"], crab::INT_TYPE, 32);
-  z_var y (vfac ["y"], crab::INT_TYPE, 32);  
+  z_var k(vfac ["k"], crab::INT_TYPE, 32);
+  z_var n(vfac ["n"], crab::INT_TYPE, 32);
+  z_var x(vfac ["x"], crab::INT_TYPE, 32);
+  z_var y(vfac ["y"], crab::INT_TYPE, 32);
+  z_var t(vfac ["t"], crab::INT_TYPE, 32);
   // entry and exit block
-  z_cfg_t* cfg = new z_cfg_t("entry","exit");
+  z_cfg_t* cfg = new z_cfg_t("entry","ret");
   // adding blocks
   z_basic_block_t& entry = cfg->insert ("entry");
-  z_basic_block_t& header   = cfg->insert ("header");
-  z_basic_block_t& body   = cfg->insert ("body");
-  z_basic_block_t& exit   = cfg->insert ("exit");
-  
-  // adding control flow 
-  entry >> header;
-  header >> body;
-  body >> header;
-  header >> exit;
-  
+  z_basic_block_t& loop = cfg->insert ("loop");
+  z_basic_block_t& loop_body_1 = cfg->insert ("loop_body_1");
+  z_basic_block_t& loop_body_2 = cfg->insert ("loop_body_2");
+  z_basic_block_t& loop_body_3 = cfg->insert ("loop_body_3");
+  z_basic_block_t& loop_body_4 = cfg->insert ("loop_body_4");  
+  z_basic_block_t& ret = cfg->insert ("ret");
+  // adding control flow
+  entry >> loop;
+  loop >> loop_body_1;
+  loop_body_1 >> loop_body_2;
+  loop_body_2 >> loop_body_3;
+  loop_body_3 >> loop_body_4;    
+  loop_body_4 >> loop;
+  loop >> ret;
   // adding statements
-  entry.assign (x, z_number(1));
-  entry.assign (y, z_number(0));
+  //  entry.assign (x1, 1);
+  entry.assign(k, 200);
+  entry.assign(n, 100);
+  entry.assign(x, 0);
+  entry.assign(y, k);
+  loop_body_1.assume(x <= n - 1);
+  loop_body_2.add(x, x, 1);
+  loop_body_3.assign(t, 2*x);
+  loop_body_4.sub(y, k , t);
   
-  body.add(x, x, y);
-  body.add(y, y, z_number(1));  
-
-  exit.assertion (x >= y);
+  ret.assume(x >= n);
+  ret.assertion(x + y <= k);
   return cfg;
 }
 
 /* Example of how to infer invariants from the above CFG */
-int main (int argc, char** argv )
-{
-#ifdef HAVE_LDD
-  
+int main (int argc, char** argv ) {
   SET_TEST_OPTIONS(argc,argv)
-
-  variable_factory_t vfac;
-
-  z_cfg_t* cfg1 = prog1 (vfac);      
-  z_cfg_t* cfg2 = prog2 (vfac);
-  z_cfg_t* cfg3 = prog3 (vfac);
-  z_cfg_t* cfg4 = prog4 (vfac);
-  z_cfg_t* cfg5 = prog5 (vfac);
-  z_cfg_t* cfg6 = prog6 (vfac);  
-
-  cfg1->simplify (); // this is optional
-  crab::outs() << *cfg1 << "\n";
-  run<z_boxes_domain_t>(cfg1,cfg1->entry(),false,10,2,20,stats_enabled);
-
-  cfg2->simplify (); // this is optional
-  crab::outs() << *cfg2 << "\n";
-  run<z_boxes_domain_t>(cfg2,cfg2->entry(),false,10,2,20,stats_enabled);
-  
-  cfg3->simplify (); // this is optional
-  crab::outs() << *cfg3 << "\n";
-  run<z_boxes_domain_t>(cfg3,cfg3->entry(),false,10,2,20,stats_enabled);
-
-  cfg4->simplify (); // this is optional
-  crab::outs() << *cfg4 << "\n";
-  run<z_boxes_domain_t>(cfg4,cfg4->entry(),false,10,2,20,stats_enabled);
-
-  crab::outs() << *cfg5 << "\n";
-  run<z_boxes_domain_t>(cfg5,cfg5->entry(),false,10,2,20,stats_enabled);
-
-  crab::outs() << *cfg6 << "\n";
-  run<z_boxes_domain_t>(cfg6,cfg6->entry(),false,1,2,20,stats_enabled);
-  
-  delete cfg1;
-  delete cfg2;
-  delete cfg3;
-  delete cfg4;
-  delete cfg5;
-  delete cfg6;
-
-  if (true) { 
-    crab::outs() << "Testing some boxes operations ...\n";
-    z_var x(vfac["x"], crab::INT_TYPE, 32);
-    z_var y(vfac["y"], crab::INT_TYPE, 32);
-    z_var z(vfac["z"], crab::INT_TYPE, 32);
-
-    z_boxes_domain_t inv1 = z_boxes_domain_t::top ();
-
-    inv1.assign (y, 6);
-    inv1.assign (z, 7);
-
-    z_boxes_domain_t inv2 = z_boxes_domain_t::top ();
-    inv2.assign (y, 3);
-    inv2.assign (z, 4);
-
-    z_boxes_domain_t inv3 = inv1 | inv2;
-
-    crab::outs() << inv3 << "\n";
-   
-    crab::outs() << x << ":=" << y << " + " << z << "= \n";
-    inv3.apply (OP_ADDITION, x, y, z);
-    crab::outs() << inv3 << "\n";
+  {
+    variable_factory_t vfac;
+    z_cfg_t* cfg = prog1 (vfac);
+    crab::outs() << *cfg << "\n";
     
-    z_boxes_domain_t inv4 (inv3); // for later
-    z_boxes_domain_t inv5 (inv3); // for later
-    
-    crab::outs() << x << ":=" << y << " - " << z << "= \n";
-    inv3.apply (OP_SUBTRACTION, x, y, z);
-    crab::outs() << inv3 << "\n";
-
-    crab::outs() << x << ":=" << y << " * " << z << "= \n";
-    inv3.apply (OP_MULTIPLICATION, x, y, z);
-    crab::outs() << inv3 << "\n";
-
-    crab::outs() << x << ":=" << y << " / " << z << "= \n";
-    inv3.apply (OP_SDIV, x, y, z);
-    crab::outs() << inv3 << "\n";
-
-
-    z_var cx (vfac["x"], crab::INT_TYPE, 32);
-    z_var cy (vfac["y"], crab::INT_TYPE, 32);
-    z_var cz (vfac["z"], crab::INT_TYPE, 32);
-
-    
-    crab::outs() << "INV: " << inv4 << "\n";
-    inv4 +=  (cx >= cy);
-    crab::outs() << "ADDED x >= y \n" << inv4 << "\n";
-    crab::outs() << "INV: " << inv5<< "\n";
-    inv5 +=  (cx <= cy + cz - 1);
-    crab::outs() << "ADDED x <= y + z -1\n" << inv5 << "\n";
-
-    
-    z_boxes_domain_t inv6;
-    crab::outs() << "INV: " << inv6 << "\n";
-    inv6 +=  (cx != 9);
-    crab::outs() << "ADDED x != 9\n" << inv6 << "\n";    
-    inv6 +=  (cy >=  9);
-    crab::outs() << "ADDED y >= 9\n" << inv6 << "\n";    
-    inv6 +=  (cy <=  9);
-    crab::outs() << "ADDED y <= 9\n" << inv6 << "\n";    
-    inv6 +=  (cz >= 10); 
-    crab::outs() << "ADDED z > 9\n" << inv6 << "\n";    
-    inv6 +=  (cz <= 8);
-    crab::outs() << "ADDED z < 9\n" << inv6 << "\n";    
+    #ifdef HAVE_APRON
+    run<z_oct_apron_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);
+    #endif
+    run<z_soct_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);
+    delete cfg;
   }
-#endif
+
+  {
+    variable_factory_t vfac;
+    z_cfg_t* cfg = prog2 (vfac);
+    crab::outs() << *cfg << "\n";
+    #ifdef HAVE_APRON    
+    run<z_oct_apron_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);
+    #endif
+    run<z_soct_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);    
+    delete cfg;
+  }
+
+  {
+    variable_factory_t vfac;
+    z_cfg_t* cfg = prog3 (vfac);
+    crab::outs() << *cfg << "\n";
+    #ifdef HAVE_APRON
+    run<z_oct_apron_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);
+    #endif
+    run<z_soct_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);    
+    delete cfg;
+  }
+
+  {
+    variable_factory_t vfac;
+    z_cfg_t* cfg = prog4 (vfac);
+    crab::outs() << *cfg << "\n";
+    #ifdef HAVE_APRON
+    run<z_oct_apron_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);
+    #endif
+    run<z_soct_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);    
+    delete cfg;
+  }
+
+  {
+    variable_factory_t vfac;
+    z_cfg_t* cfg = prog5 (vfac);
+    crab::outs() << *cfg << "\n";
+    #ifdef HAVE_APRON
+    run<z_oct_apron_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);
+    #endif
+    run<z_soct_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);    
+    delete cfg;
+  }
+
+  {
+    variable_factory_t vfac;
+    z_cfg_t* cfg = prog6 (vfac);
+    crab::outs() << *cfg << "\n";
+    #ifdef HAVE_APRON
+    run<z_oct_apron_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);
+    #endif
+    run<z_soct_domain_t>(cfg, cfg->entry(), false, 1, 2, 20, stats_enabled);    
+    delete cfg;
+  }
   
   return 0;
 }
